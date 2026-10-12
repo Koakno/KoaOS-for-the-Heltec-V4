@@ -1,0 +1,31 @@
+# Builds every KoaOS app to .esp on GitHub's servers (no PC needed).
+# Runs on the whole repo; builds the SDK in koaos-sdk/. Run it from the Actions tab.
+# Download the "esp-packages" artifact when it finishes.
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld python3-cryptography
+      - name: Native tests (crypto + app logic)
+        run: make mctest
+        working-directory: koaos-sdk
+      - name: Build wasm apps and pack .esp
+        run: make
+        working-directory: koaos-sdk
+      - name: Show what was built
+        working-directory: koaos-sdk
+        run: |
+          ls -l dist
+          for f in dist/*.esp; do python3 tools/esppack.py info "$f"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp-packages
+          path: koaos-sdk/dist/*.esp
