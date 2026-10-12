@@ -1,0 +1,5 @@
+name=hellowasm
+version=1.0
+abi=1
+type=wasm
+entry=hellowasm.wasm

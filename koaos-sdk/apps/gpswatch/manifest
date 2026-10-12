@@ -1,0 +1,6 @@
+name=gpswatch
+version=1.0
+abi=1
+type=wasm
+entry=gpswatch.wasm
+requires=gps

@@ -1,0 +1,6 @@
+name=meshcore
+version=0.1
+abi=1
+type=wasm
+entry=meshcore.wasm
+requires=lora

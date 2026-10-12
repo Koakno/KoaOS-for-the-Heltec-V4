@@ -1,0 +1,6 @@
+name=iodemo
+version=1.0
+abi=2
+type=wasm
+entry=iodemo.wasm
+requires=gpio,i2c

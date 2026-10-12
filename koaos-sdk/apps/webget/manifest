@@ -1,0 +1,6 @@
+name=webget
+version=1.0
+abi=1
+type=wasm
+entry=webget.wasm
+requires=wifi
