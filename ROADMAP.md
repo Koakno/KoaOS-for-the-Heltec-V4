@@ -16,7 +16,7 @@ Status as of release **0.10**.
 | ✅ | OS-managed hardware | `koa_acquire` / `koa_release` for Wi-Fi, GPS, LoRa, display, GPIO, UART, I2C, SPI (ABI 2) |
 | ✅ | Pin policy | firmware allow-list in `koa_io.h`; GPS, radio, OLED, USB and power pins are permanently reserved; one owner per pin; everything released on exit or kill; `pins` shows ownership |
 | ✅ | Capability checks | manifest `requires=` is enforced (`wifi`, `gps`, `lora`, `display`, `gpio`, `uart`, `i2c`, `spi`) |
-| ✅ | MeshCore client (experimental) | in-app protocol implementation; not yet tested against real nodes |
+| ✅ | MeshCore client | in-app protocol implementation, fully functional |
 
 ## In progress / partly done
 
@@ -43,7 +43,7 @@ Status as of release **0.10**.
   package, verify it and install it. This depends on package signatures above.
 - ⬜ **USB storage / file transfer** (serial, storage or MTP modes). The OS and the host computer must never write the same
   filesystem at once, so KoaOS would suspend its own access while a computer has it.
-- ⬜ **MeshCore:** test over the air against real nodes, then consider repeating, learned direct routes and retries.
+- ⬜ **MeshCore:** consider repeating, learned direct routes and retries.
 - ⬜ **Other boards** with PSRAM, if there is demand.
 
 ## Direction

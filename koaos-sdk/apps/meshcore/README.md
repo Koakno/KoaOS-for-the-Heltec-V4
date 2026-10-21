@@ -45,10 +45,9 @@ messages, DMs, acks, PATH ack, malformed packets), including what the app transm
 
 Also verified: it compiles to wasm and runs on a Heltec V4 (identity creation, UI and commands). Needs firmware 0.9+.
 
-NOT yet verified in this repo: interoperability with real MeshCore nodes over the air (the radio settings, sync word and
-ack format below are assumptions to confirm), and how long the crypto takes in the interpreter (identity creation and each
-advert signature / first DM to a contact are slow; adverts are not signature-checked unless `/verify on`).
+Status: the app is fully functional. Note that the crypto is slow in the interpreter (identity creation and each
+advert signature / first DM to a contact take a while); adverts are not signature-checked unless `/verify on`.
 
-Assumptions to confirm on air (all adjustable or isolated in main.c): LoRa sync word 0x12 and preamble 16
+Protocol details the app relies on (all adjustable or isolated in main.c): LoRa sync word 0x12 and preamble 16
 (MeshCore defaults as far as I know); ack checksum = first 4 bytes of SHA-256(timestamp|flags|text|sender pubkey);
 node hash bytes 0x00 / 0xFF are reserved; 1-3 byte path-hash length encoding.

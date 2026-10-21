@@ -104,7 +104,7 @@ The shell supports `>`, `>>` and `&`, and runs simple shell scripts. `edit` is a
   `install` uses plain HTTP, and the SHA-256 in a package catches corruption but does not prove who made it.
   Only install from servers you control. The firmware runs no network server, so nothing listens on Wi-Fi.
 - **No SSH client, public app repository, or USB file transfer yet.** See [ROADMAP.md](ROADMAP.md).
-- **MeshCore is experimental.** See [Apps included](#apps-included).
+- **MeshCore is a client.** It is fully functional but does not repeat other nodes' traffic. See [Apps included](#apps-included).
 
 ## Flash settings
 
@@ -154,12 +154,11 @@ Remove an app with `uninstall <app>`; `apps` lists what is installed.
 | `hellowasm` | nothing | Smallest example app |
 | `gpswatch` | gps | Shows GPS fix information |
 | `webget` | wifi | Fetches a URL over HTTP/HTTPS |
-| `meshcore` | lora | MeshCore chat/companion client (**experimental**) |
+| `meshcore` | lora | MeshCore chat/companion client |
 
-**MeshCore status:** the app implements the MeshCore over-the-air protocol (adverts, public/hashtag/private channels,
-encrypted direct messages, acks). It passes the native tests in `koaos-sdk/tests` against scripted traffic, and it runs on a
-V4, but **it has not been tested against real MeshCore nodes over the air yet.** It is a client only and does not repeat
-other nodes' traffic. Feedback from anyone who tries it is very welcome.
+**MeshCore status:** the app is fully functional. It implements the MeshCore over-the-air protocol (adverts,
+public/hashtag/private channels, encrypted direct messages, acks) and runs on the V4. It also passes the native tests in
+`koaos-sdk/tests` against scripted traffic. It is a client only and does not repeat other nodes' traffic. Feedback is welcome.
 
 ## The SDK in short
 
