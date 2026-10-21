@@ -17,6 +17,7 @@
 #include <wasm3.h>          // "Wasm3" library (Library Manager). Needs a one-time allocator patch: see WASM RUNTIME section
 #include "koaos_abi.h"   // shared with the SDK: error codes, KC_* capabilities, API structs
 #include "esp_pkg.h"        // .esp package format: parser, manifest, sha-256 (portable, unit-tested on a PC)
+#include "koa_vga.h"        // VGA text + 320x240 graphics output, switched on/off at run time with the "vga" command (wiring in koa_vga.h)
 #include "koa_io.h"         // pin allow-list + pin ownership table for app GPIO/UART/I2C/SPI (portable, unit-tested on a PC)
 #include <driver/gpio.h>   // gpio_set_level: preset an output latch before the pin becomes an output
 
@@ -25,9 +26,10 @@ HWCDC USBSerial;
 
 #define OSNAME       "KoaOS"
 #define HOSTNAME     "koa"   // prompt/login/neofetch hostname
-#define OSVER        "0.10"
+#define OSVER        "0.12"
 #define LOGIN_USER   "root"
 #define LOGIN_PASS   "1234"
+
 #define VEXT_PIN     36
 #define OLED_SDA     17
 #define OLED_SCL     18
@@ -145,6 +147,12 @@ int  p_wasm(int, char**);
 Proc procs[MAXPROC];
 int nextPid = 1;
 volatile int fgpid = 0;
+volatile int guiPid = 0;                         // pid of the running "gui" program (0 = none); see koa_gui.h
+#ifndef KOA_NO_VGA
+bool guiBootFlag();
+#else
+static inline bool guiBootFlag() { return false; }
+#endif
 
 // ================= TTY =================
 char scr[ROWS][COLS + 1];
@@ -200,7 +208,7 @@ void ttyWrite(const char* b, int n) {
     if (t >= 125) { Serial.write((const uint8_t*)tmp, t); t = 0; }
   }
   if (t) Serial.write((const uint8_t*)tmp, t);
-  if (!noscr) for (int i = 0; i < n; i++) scrPut(b[i]);
+  if (!noscr) for (int i = 0; i < n; i++) { scrPut(b[i]); vgaPut(b[i]); }
   xSemaphoreGive(ttyMx);
 }
 
@@ -208,6 +216,7 @@ void ttyEchoBackspace() {
   xSemaphoreTake(ttyMx, portMAX_DELAY);
   Serial.print("\b \b");
   if (curCol > 0) { curCol--; scr[curRow][curCol] = 0; dirty = true; }
+  vgaBackspace();
   xSemaphoreGive(ttyMx);
 }
 
@@ -312,6 +321,7 @@ void procFinish(Proc* p, int rc) {
   wasmTeardown(p);                  // wasm app memory goes back to PSRAM first
   ipcDropAll(p->pid);
   for (int i = 0; i < MAXFD; i++) fdRelease(p->fd[i], true);
+  if (p->pid == guiPid) { guiPid = 0; vgaGfxEnd(); }   // the gui was killed: give the 38 KB framebuffer back, text mode returns
   resReleaseAll(p);                 // radio, gps, display: freed however the process ended
   if (fgpid == p->pid) { fgpid = p->ppid; ttyReset(); }
   if (p->flags & PF_BG) {
@@ -814,6 +824,23 @@ static void ioPinsRelease(int pid, int kind) {
   }
 }
 
+// shuts the app I2C bus (Wire1) and frees its pins. Caller holds resMx.
+static void i2cShutdown(int pid) {
+  if (i2cOpen) Wire1.end();
+  i2cOpen = false;
+  ioPinsRelease(pid, KP_I2C);
+}
+
+// shuts the app SPI bus (HSPI) and frees its pins, CS included. Caller holds resMx.
+static void spiShutdown(int pid) {
+  if (spiOpen) {
+    if (spiCs >= 0) digitalWrite(spiCs, HIGH);   // deselect the device before letting go
+    appSpi.end();
+  }
+  spiOpen = false; spiCs = -1; spiCsHeld = false;
+  ioPinsRelease(pid, KP_SPI);
+}
+
 // closes one UART slot. Caller holds resMx. (Draining the TX queue is the caller's job: this must never block.)
 static void uartShut(int slot) {
   UartSlot& u = uartSlot[slot];
@@ -826,17 +853,6 @@ static void uartShut(int slot) {
 
 static void uartCloseAll(int pid) {
   for (int i = 0; i < 2; i++) if (uartSlot[i].open && uartSlot[i].pid == pid) uartShut(i);
-}
-
-static void i2cShutdown(int pid) {
-  if (i2cOpen) { Wire1.end(); i2cOpen = false; }
-  ioPinsRelease(pid, KP_I2C);
-}
-
-static void spiShutdown(int pid) {
-  if (spiOpen) { appSpi.end(); spiOpen = false; }
-  spiCs = -1; spiCsHeld = false;
-  ioPinsRelease(pid, KP_SPI);
 }
 
 // ================= RESOURCES =================
@@ -935,9 +951,62 @@ int readline(char* buf, int max) {
   return n;
 }
 
+// ================= VGA (run-time switch) =================
+// koa_vga.h does the video; this section owns the pins. "vga on" claims GPIO 3 4 5 6 47 48 in the pin table under VGA_PID
+// (so apps cannot use them meanwhile, and "vga on" refuses to start if something else holds one),
+// then starts the LCD peripheral. "vga off" stops it and releases the pins. No framebuffer, nothing in PSRAM.
+#define VGA_PID        (-78)   // owner id of the VGA pins in the pin table
+#define VGA_BOOT_FILE  "/config/vga"   // exists = start VGA at boot
+
+static const int vgaPinList[6] = { VGA_PIN_R, VGA_PIN_G, VGA_PIN_B, VGA_PIN_HSYNC, VGA_PIN_VSYNC, VGA_PIN_PCLK };
+
+static const char* pinWho(int pid) {            // who holds a pin, for "pins" and error messages
+  if (pid == VGA_PID) return "vga";
+  for (int j = 0; j < MAXPROC; j++) if (procs[j].used && procs[j].pid == pid) return procs[j].name;
+  return "?";
+}
+
+// returns KE_OK, KE_BUSY (a pin is taken: *who names the holder) or KE_IO (the LCD driver would not start)
+static int vgaEnable(const char** who) {
+  if (vgaActive()) return KE_OK;
+  xSemaphoreTake(resMx, portMAX_DELAY);
+  int rc = kio_claim_set_sys(&ioPins, vgaPinList, 6, VGA_PID, KP_GPIO);
+  if (rc == KE_BUSY && who) {
+    *who = "?";
+    for (int i = 0; i < 6; i++) if (ioPins.pid[vgaPinList[i]]) { *who = pinWho(ioPins.pid[vgaPinList[i]]); break; }
+  }
+  xSemaphoreGive(resMx);
+  if (rc != KE_OK) return rc;
+  xSemaphoreTake(ttyMx, portMAX_DELAY);          // vgaPut() runs under ttyMx, so start/stop under it too
+  bool ok = vgaBegin();
+  xSemaphoreGive(ttyMx);
+  if (!ok) {
+    xSemaphoreTake(resMx, portMAX_DELAY);
+    ioPinsRelease(VGA_PID, KP_GPIO);
+    xSemaphoreGive(resMx);
+    return KE_IO;
+  }
+  return KE_OK;
+}
+
+static void vgaDisable() {
+  xSemaphoreTake(ttyMx, portMAX_DELAY);
+  vgaEnd();
+  xSemaphoreGive(ttyMx);
+  xSemaphoreTake(resMx, portMAX_DELAY);
+  ioPinsRelease(VGA_PID, KP_GPIO);
+  xSemaphoreGive(resMx);
+}
+
+static bool vgaBootFlag() { int fd = sys_open(VGA_BOOT_FILE, K_RD); if (fd < 0) return false; sys_close(fd); return true; }
+static void vgaBootSet(bool on) {
+  if (on) { int fd = sys_open(VGA_BOOT_FILE, K_WR); if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); } }
+  else sys_unlink(VGA_BOOT_FILE);
+}
+
 // ================= PROGRAMS =================
 int p_help(int, char**) {
-  pr("help clear uname uptime\nfree df ls cat rm echo\ndate whoami reboot gps\nedit <file> neofetch\nps kill sleep exit pins\nwifi aprs aprsd weather\nrun install uninstall apps\nuse > >> and & in sh\n");
+  pr("help clear uname uptime\nfree df ls cat rm echo\ndate whoami reboot gps\nedit <file> neofetch\nps kill sleep exit pins\nwifi aprs aprsd weather\nrun install uninstall apps\nvga on|off gui\nuse > >> and & in sh\n");
   return 0;
 }
 
@@ -968,13 +1037,40 @@ int p_pins(int, char**) {                       // what apps may use, and who ho
   int n = 0;
   for (int i = 0; i < KIO_NPINS; i++) {
     if (!ioPins.pid[i]) continue;
-    const char* who = "?";
-    for (int j = 0; j < MAXPROC; j++) if (procs[j].used && procs[j].pid == ioPins.pid[i]) who = procs[j].name;
+    const char* who = pinWho(ioPins.pid[i]);
     prf("%2d %-4s %s\n", i, kn[ioPins.kind[i] <= KP_SPI ? ioPins.kind[i] : 0], who);
     n++;
   }
   if (!n) pr("none in use\n");
   return 0;
+}
+
+int p_vga(int argc, char** argv) {              // vga on|enabled | off|disabled | status | boot on|off
+  const char* a = argc > 1 ? argv[1] : "status";
+  if (!strcmp(a, "on") || !strcmp(a, "enable") || !strcmp(a, "enabled")) {
+    if (vgaActive()) { pr("vga already on\n"); return 0; }
+    const char* who = "?";
+    int r = vgaEnable(&who);
+    if (r == KE_BUSY) { prf("vga: pins busy (held by %s, see: pins)\n", who); return 1; }
+    if (r != KE_OK) { pr("vga: could not start the video driver\n"); return 1; }
+    prf("vga on: 640x480, R=%d G=%d B=%d HS=%d VS=%d (GPIO%d unused clock pin)\n", VGA_PIN_R, VGA_PIN_G, VGA_PIN_B, VGA_PIN_HSYNC, VGA_PIN_VSYNC, VGA_PIN_PCLK);
+    return 0;
+  }
+  if (!strcmp(a, "off") || !strcmp(a, "disable") || !strcmp(a, "disabled")) {
+    if (!vgaActive()) { pr("vga already off\n"); return 0; }
+    if (guiPid) { pr("vga: the gui is running (leave it first)\n"); return 1; }
+    vgaDisable();
+    pr("vga off: pins released\n");
+    return 0;
+  }
+  if (!strcmp(a, "status")) { prf("vga: %s, start at boot: %s\n", vgaActive() ? "on" : "off", vgaBootFlag() ? "yes" : "no"); return 0; }
+  if (!strcmp(a, "boot") && argc > 2 && (!strcmp(argv[2], "on") || !strcmp(argv[2], "off"))) {
+    vgaBootSet(!strcmp(argv[2], "on"));
+    prf("vga will %sstart at boot\n", !strcmp(argv[2], "on") ? "" : "not ");
+    return 0;
+  }
+  pr("usage: vga on|off|status|boot on|off\n(also: vga enabled / vga disabled)\n");
+  return 1;
 }
 
 int p_df(int, char**) {
@@ -1510,6 +1606,10 @@ int p_sh(int argc, char** argv) {
 }
 
 int p_init(int, char**) {
+  if (guiBootFlag()) {                           // "gui boot on": the desktop comes up before the login prompt
+    int gp = sys_spawn("gui", "", -1, false);
+    if (gp > 0) sys_wait(gp);
+  }
   for (;;) {
     int pid = sys_spawn("login", "", -1, false);
     if (pid < 0) { sys_sleep(1000); continue; }
@@ -3017,6 +3117,26 @@ int p_aprs(int argc, char** argv) {
   return 0;
 }
 
+#ifndef KOA_NO_VGA
+// ================= GUI (koa_gui.h) =================
+// hooks the GUI needs from the firmware
+static bool guiIsDir(const char* p) { File f = LittleFS.open(p, "r"); bool d = f && f.isDirectory(); f.close(); return d; }
+static void* guiAlloc(size_t n) { void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM); return p ? p : malloc(n); }   // big buffers go to PSRAM
+static void guiFree(void* p) { free(p); }
+static void guiPsram(unsigned long* fr, unsigned long* tot) { *fr = heap_caps_get_free_size(MALLOC_CAP_SPIRAM); *tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM); }
+static void guiOled() {                           // the OLED is ours while the desktop runs (TTY_GFX stops the console drawing it)
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tr);
+  display.drawStr(0, 14, "KoaOS desktop");
+  display.drawStr(0, 30, "on the VGA output");
+  display.drawStr(0, 54, "Esc = power menu");
+  display.sendBuffer();
+}
+#include "koa_gui.h"
+#else
+int p_gui(int, char**) { pr("gui: this build has KOA_NO_VGA set\n"); return 1; }
+#endif
+
 // ================= PROGRAM TABLE =================
 // ================= PACKAGE INSTALLER =================
 #define MAXPKG 1048576   // largest single download (bytes)
@@ -3487,7 +3607,7 @@ const Prog progs[] = {
   {"gps", p_gps, 0}, {"edit", p_edit, 0}, {"nano", p_edit, 0}, {"vi", p_edit, 0},
   {"neofetch", p_neofetch, 0}, {"fetch", p_neofetch, 0},
   {"wifi", p_wifi, 0}, {"aprs", p_aprs, 0}, {"aprsd", p_aprsd, 0},
-  {"ps", p_ps, 0}, {"pins", p_pins, 0}, {"kill", p_kill, 0}, {"sleep", p_sleep, 0},
+  {"ps", p_ps, 0}, {"pins", p_pins, 0}, {"vga", p_vga, 0}, {"gui", p_gui, PF_BIGSTACK}, {"kill", p_kill, 0}, {"sleep", p_sleep, 0},
   {"run", p_run, 0}, {"install", p_install, PF_BIGSTACK}, {"uninstall", p_uninstall, 0}, {"apps", p_apps, 0},
   {"weather", p_weather, PF_BIGSTACK},
   {"login", p_login, PF_NOKILL}, {"sh", p_sh, PF_NOKILL},
@@ -3551,6 +3671,11 @@ void setup() {
   bool ok = LittleFS.begin(true);
   bootMsg(ok ? "vfs: rootfs mounted" : "vfs: mount FAILED", 300);
   if (ok) { LittleFS.mkdir("/apps"); LittleFS.mkdir("/config"); LittleFS.mkdir("/data"); rmTree("/apps/.new"); }   // .new = an install that was interrupted
+  if (ok && vgaBootFlag()) {
+    const char* who = "?";
+    int r = vgaEnable(&who);
+    bootMsg(r == KE_OK ? "tty1: vga 640x480 ready" : "tty1: vga FAILED", 200);
+  }
   bootMsg("gps: standby", 200);
   bootMsg("proc: starting init", 300);
   kprintf("\n%s %s tty1\n\n", OSNAME, OSVER);
@@ -3581,6 +3706,13 @@ void loop() {
       lastDraw = now;
       drawTerm();
     }
+    xSemaphoreGive(ttyMx);
+  }
+  static unsigned long lastVga = 0;
+  if (vgaActive() && now - lastVga > 33) {   // the picture is generated continuously; this only drives the cursor blink
+    lastVga = now;
+    xSemaphoreTake(ttyMx, portMAX_DELAY);
+    vgaFlush(blinkOn);
     xSemaphoreGive(ttyMx);
   }
   delay(1);

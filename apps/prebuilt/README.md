@@ -7,7 +7,7 @@
 | webget | wifi | fetches a URL over HTTP/HTTPS |
 | meshcore | lora | MeshCore chat/companion node (see `koaos-sdk/apps/meshcore/README.md`) |
 
-All four are ABI v1 packages, which run unchanged on firmware 0.10 (ABI 2). `iodemo` (GPIO/I2C) is not prebuilt: run `make iodemo` in `koaos-sdk/` and copy `dist/iodemo.esp` here if you want it. Serve this folder and install from the board:
+meshcore, webget, gpswatch and hellowasm are ABI v1 packages , which run unchanged on firmware 0.10 (ABI 2). `iodemo` (GPIO/I2C) is not prebuilt: run `make iodemo` in `koaos-sdk/` and copy `dist/iodemo.esp` here if you want it. Serve this folder and install from the board:
 ```
 python3 ../../koaos-sdk/tools/repo_server.py . 8000
 # on the board:

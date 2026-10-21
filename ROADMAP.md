@@ -1,7 +1,7 @@
 # Roadmap
 
 Where KoaOS is and where it is going. This is a plan, not a promise: priorities change as people use it.
-Status as of release **0.10**.
+Status as of release **0.12**.
 
 **Legend:** ✅ done · 🟡 partly done · ⬜ planned
 
@@ -16,7 +16,9 @@ Status as of release **0.10**.
 | ✅ | OS-managed hardware | `koa_acquire` / `koa_release` for Wi-Fi, GPS, LoRa, display, GPIO, UART, I2C, SPI (ABI 2) |
 | ✅ | Pin policy | firmware allow-list in `koa_io.h`; GPS, radio, OLED, USB and power pins are permanently reserved; one owner per pin; everything released on exit or kill; `pins` shows ownership |
 | ✅ | Capability checks | manifest `requires=` is enforced (`wifi`, `gps`, `lora`, `display`, `gpio`, `uart`, `i2c`, `spi`) |
-| ✅ | MeshCore client (experimental) | in-app protocol implementation; not yet tested against real nodes |
+| ✅ | VGA text output | `vga on|off`, 640x480, no framebuffer, pins claimed in the pin table and released on `vga off` |
+| ✅ | Graphical desktop | `gui`: 320x240 graphics mode on VGA, launcher, files, editor, Wi-Fi, GPS, system, app launcher; keyboard over USB serial |
+| ✅ | MeshCore client | in-app protocol implementation, fully functional |
 
 ## In progress / partly done
 
@@ -31,6 +33,7 @@ Status as of release **0.10**.
 - ⬜ **GPIO-based drivers.** Apps can already drive pins, UART, I2C and SPI. What is missing is OS-level drivers built on top.
 - ⬜ **I2C keyboard support**, so the board can be used without a USB terminal.
 - ⬜ **GPIO interrupts / edge waits**, **PWM** and **ADC** for apps.
+- ⬜ **Desktop: windows for installed apps.** A graphics/input API so wasm apps can draw and take keys in the desktop (today they run on the console).
 - ⬜ **Display API for apps.** The `display` capability is reserved in the ABI; apps cannot draw yet.
 - ⬜ Command-line arguments for apps (the ABI has no call for them yet).
 - ⬜ Optional per-app pin lists in the manifest as an extra lock, SPI with several chip-selects, sharing the I2C bus with the OLED.
@@ -43,7 +46,7 @@ Status as of release **0.10**.
   package, verify it and install it. This depends on package signatures above.
 - ⬜ **USB storage / file transfer** (serial, storage or MTP modes). The OS and the host computer must never write the same
   filesystem at once, so KoaOS would suspend its own access while a computer has it.
-- ⬜ **MeshCore:** test over the air against real nodes, then consider repeating, learned direct routes and retries.
+- ⬜ **MeshCore:** consider repeating, learned direct routes and retries.
 - ⬜ **Other boards** with PSRAM, if there is demand.
 
 ## Direction

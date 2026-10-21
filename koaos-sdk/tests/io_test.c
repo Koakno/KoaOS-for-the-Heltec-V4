@@ -46,6 +46,28 @@ int main(void) {
   CHECK(kio_claim_set(&t, ok, 3, 1, KP_UART) == KE_OK && kio_owned(&t, 3, 1, KP_UART) && kio_owned(&t, 4, 1, KP_UART));
   CHECK(kio_next(&t, 1, KP_UART, 0) == 3 && kio_next(&t, 1, KP_UART, 4) == 4 && kio_next(&t, 1, KP_UART, 5) == -1);
 
+  /* OS-owned pins (VGA, link): claimed outside the app allow-list, all or nothing, and apps are locked out while held */
+  kio_init(&t);
+  int vga[6] = { 4, 5, 6, 47, 48, 3 };
+  CHECK(kio_claim_set_sys(&t, vga, 6, -78, KP_GPIO) == KE_OK);
+  for (int i = 0; i < 6; i++) CHECK(kio_owned(&t, vga[i], -78, KP_GPIO) && kio_claim(&t, vga[i], 1, KP_GPIO, KG_IN) == KE_BUSY);
+  CHECK(kio_claim_set_sys(&t, vga, 6, -78, KP_GPIO) == KE_BUSY);                              /* already on */
+  for (int i = 0; i < 6; i++) CHECK(kio_release(&t, vga[i], -78, KP_GPIO) == KE_OK);
+  CHECK(kio_claim(&t, 4, 1, KP_GPIO, KG_IN) == KE_OK);                                        /* off again: apps may have them */
+  CHECK(kio_claim_set_sys(&t, vga, 6, -78, KP_GPIO) == KE_BUSY && !t.pid[5] && !t.pid[47]);   /* an app holds 4: nothing half-claimed */
+  kio_init(&t);
+  int lk[2] = { 15, 16 };
+  CHECK(kio_pin_allowed(15) && kio_pin_allowed(16));                                          /* link pins are in the allow-list... */
+  CHECK(kio_claim_set(&t, lk, 2, -77, KP_UART) == KE_OK);                                     /* link bridge holds 15 and 16 */
+  CHECK(kio_claim_set_sys(&t, vga, 6, -78, KP_GPIO) == KE_OK);                                /* ...and VGA still starts: both at once */
+  for (int i = 0; i < 6; i++) kio_release(&t, vga[i], -78, KP_GPIO);
+  kio_init(&t);
+  int lkold[2] = { 4, 5 };
+  CHECK(kio_claim_set(&t, lkold, 2, 1, KP_UART) == KE_OK);                                    /* an app holding a VGA pin */
+  CHECK(kio_claim_set_sys(&t, vga, 6, -78, KP_GPIO) == KE_BUSY && !t.pid[6] && !t.pid[3]);    /* makes vga on refuse */
+  int bad[2] = { 3, 3 };   CHECK(kio_claim_set_sys(&t, bad, 2, -78, KP_GPIO) == KE_INVAL);
+  int none2[2] = { -1, -1 }; CHECK(kio_claim_set_sys(&t, none2, 2, -78, KP_GPIO) == KE_INVAL);
+
   /* manifest: the category is declared, pins are not */
   uint32_t caps; char err[64];
   CHECK(esp_caps_parse("gpio", &caps, err, sizeof(err)) == 0 && caps == (KC_GPIO | KC_UART));   /* gpio includes uart */

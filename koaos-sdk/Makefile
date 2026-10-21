@@ -5,6 +5,7 @@
 #   make serve           copy dist/*.esp into repo/ and start the install server
 #   make selftest        test the SDK's printf on this computer (no wasm tools needed)
 #   make iotest          test the pin policy + manifest parser used for GPIO/UART/I2C/SPI (no wasm tools needed)
+#   make guitest         compile the desktop (KoaOS/koa_gui.h) on this computer and write screenshots to gui_shots/*.ppm
 #   make clean
 #
 # Needs: clang with the wasm32 target + wasm-ld (Debian/Ubuntu: apt install clang lld),
@@ -23,7 +24,7 @@ CFLAGS  := --target=wasm32 -mcpu=mvp -Os -fno-unroll-loops -ffreestanding -fno-b
 LDFLAGS := -nostdlib -fuse-ld=lld -Wl,--no-entry -Wl,--gc-sections -Wl,--strip-all \
            -Wl,-z,stack-size=16384 -Wl,--initial-memory=65536 -Wl,--max-memory=524288
 
-.PHONY: all $(APPS) serve selftest mctest iotest clean
+.PHONY: all $(APPS) serve selftest mctest iotest guitest clean
 all: $(APPS)
 $(APPS): %: dist/%.esp
 
@@ -32,6 +33,7 @@ dist/%.esp: apps/%/manifest apps/%/main.c src/koaos.c $(wildcard include/*.h)
 	@rm -f build/$*/*
 	$(CC) $(CFLAGS) $(LDFLAGS) apps/$*/*.c src/koaos.c -o build/$*/$*.wasm
 	cp apps/$*/manifest build/$*/manifest
+	@for f in apps/$*/*.bin; do [ -f "$$f" ] && cp "$$f" build/$*/; done; true
 	$(PYTHON) tools/esppack.py pack build/$* -o $@
 
 serve: all
@@ -60,5 +62,11 @@ mctest:
 	$(PYTHON) tests/mc_app_test.py
 	@rm -f mc_crypto_test mc_app_host
 
+guitest:
+	mkdir -p gui_shots
+	g++ -std=gnu++17 -Wall -I../KoaOS tests/gui_host.cpp -o gui_host
+	./gui_host gui_shots
+	@rm -f gui_host
+
 clean:
-	rm -rf build dist build_selftest mc_crypto_test mc_app_host io_test io_test_all
+	rm -rf build dist build_selftest mc_crypto_test mc_app_host io_test io_test_all gui_host gui_shots

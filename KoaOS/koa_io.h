@@ -18,7 +18,12 @@
  * The ONLY pins an app may ever ask for (bit n = GPIOn). Everything else is KE_PERM, even if free.
  * This is the one place to edit when you wire something up. Override with -DKOA_IO_ALLOW_MASK=... if you like.
  *
- * Allowed:  3 4 5 6   40 41 42   47 48
+ * Allowed:  3 4 5 6   15 16   40 41 42   47 48
+ *
+ * 15 16       the 2x2 "additional pins" header (XTAL_32K pads, no crystal fitted): nothing else on the board uses them.
+ *              They are free for apps (nothing on the board uses them).
+ * 40 41 42     are wired to the GNSS connector on the V4 (GNSS wake-up, PPS, reset). Fine while no GPS module is plugged in;
+ *              with one attached, do not drive them (42 would hold the GPS in reset, 41 is a GPS output).
  *
  * Deliberately NOT allowed (taken by the OS or risky on the Heltec V4):
  *   0            boot button / strapping            1        battery sense
@@ -33,6 +38,7 @@
  */
 #ifndef KOA_IO_ALLOW_MASK
 #define KOA_IO_ALLOW_MASK ((1ULL << 3)  | (1ULL << 4)  | (1ULL << 5)  | (1ULL << 6)  | \
+                           (1ULL << 15) | (1ULL << 16) | \
                            (1ULL << 40) | (1ULL << 41) | (1ULL << 42) | \
                            (1ULL << 47) | (1ULL << 48))
 #endif
@@ -94,6 +100,24 @@ static inline int kio_claim_set(koa_pins_t *t, const int *pins, int n, int32_t p
   }
   if (!used) return KE_INVAL;
   for (int i = 0; i < n; i++) if (pins[i] >= 0) kio_claim(t, pins[i], pid, kind, 0);
+  return KE_OK;
+}
+
+/* claim pins for the OS itself (VGA output, ...): same all-or-nothing rules, but the app allow-list does not apply,
+ * because these pins are not being offered to an app. Used by the `vga` command. While the OS holds them, an app that
+ * asks for the same pins gets KE_BUSY; when the OS lets go they are ordinary allow-listed pins again. */
+static inline int kio_claim_set_sys(koa_pins_t *t, const int *pins, int n, int32_t pid, int kind) {
+  int used = 0;
+  for (int i = 0; i < n; i++) {
+    int p = pins[i];
+    if (p < 0) continue;
+    if (p >= KIO_NPINS) return KE_INVAL;
+    for (int j = 0; j < i; j++) if (pins[j] == p) return KE_INVAL;
+    if (t->pid[p]) return KE_BUSY;
+    used++;
+  }
+  if (!used) return KE_INVAL;
+  for (int i = 0; i < n; i++) if (pins[i] >= 0) { t->pid[pins[i]] = pid; t->kind[pins[i]] = (uint8_t)kind; t->mode[pins[i]] = 0; }
   return KE_OK;
 }
 
