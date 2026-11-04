@@ -4,11 +4,16 @@ A small Unix-style operating system for the **Heltec WiFi LoRa 32 V4** (ESP32-S3
 and you have a pocket computer with a shell, a text editor, GPS, Wi-Fi, weather and LoRa APRS. Then **install apps over
 Wi-Fi without ever reflashing**, or write your own with the included SDK.
 
+**Flash it from your browser: [flash.koakno.com](https://flash.koakno.com)**
+
 *KoaOS is an independent project and is not made or endorsed by Heltec. "Heltec" is used only to say which board it runs on.*
 
 ---
 
 ## Getting started
+
+**Quickest way:** open the web flasher at **[flash.koakno.com](https://flash.koakno.com)** and flash the prebuilt KoaOS firmware to your
+board from the browser, then continue at step 4 below. To build it yourself instead, follow all the steps.
 
 You need a Heltec WiFi LoRa 32 **V4** (not V3: KoaOS needs the V4's PSRAM), a USB cable, and the Arduino IDE
 (or ArduinoDroid on Android).
@@ -104,7 +109,7 @@ The shell supports `>`, `>>` and `&`, and runs simple shell scripts. `edit` is a
   `install` uses plain HTTP, and the SHA-256 in a package catches corruption but does not prove who made it.
   Only install from servers you control. The firmware runs no network server, so nothing listens on Wi-Fi.
 - **No SSH client, public app repository, or USB file transfer yet.** See [ROADMAP.md](ROADMAP.md).
-- **MeshCore is a client.** It is fully functional but does not repeat other nodes' traffic. See [Apps included](#apps-included).
+- **MeshCore is a client, and direct messages are not working yet.** Adverts and channel messages (the public channel and other channels) work over the air on a real V4. Sending or receiving a **direct message crashes the system** (known bug, being fixed), so use channels only for now. It does not repeat other nodes' traffic. See [Apps included](#apps-included).
 
 ## Flash settings
 
@@ -128,7 +133,7 @@ Use the Arduino IDE board **Heltec WiFi LoRa 32 (V4)**, or **ESP32S3 Dev Module*
 | Zigbee Mode | Disabled |
 
 ESP32 Arduino core 3.x. Changing the partition scheme erases the filesystem on the next flash; reflashing with the same
-scheme keeps your files and apps. If you would rather patch the stock Wasm3 library yourself, run
+scheme keeps your files and apps, including when you switch between the stable and experimental builds. If you would rather patch the stock Wasm3 library yourself, run
 `python3 tools/patch_wasm3.py` (see `lib/Wasm3/KOAOS-PATCH.md`). Without the patch, apps refuse to start.
 
 ## Installing apps
@@ -156,8 +161,8 @@ Remove an app with `uninstall <app>`; `apps` lists what is installed.
 | `webget` | wifi | Fetches a URL over HTTP/HTTPS |
 | `meshcore` | lora | MeshCore chat/companion client |
 
-**MeshCore status:** the app is fully functional. It implements the MeshCore over-the-air protocol (adverts,
-public/hashtag/private channels, encrypted direct messages, acks) and runs on the V4. It also passes the native tests in
+**MeshCore status:** channels work over the air on a real V4 (adverts and the public and other channels); **direct messages currently crash the system** (known bug, being fixed), so use channels only for now. It implements the MeshCore over-the-air protocol (adverts,
+public/hashtag/private channels, encrypted direct messages, acks) in code; direct messages are the part that does not work on hardware yet. It also passes the native tests in
 `koaos-sdk/tests` against scripted traffic. It is a client only and does not repeat other nodes' traffic. Feedback is welcome.
 
 ## The SDK in short
@@ -186,7 +191,8 @@ need in `manifest` and pick pins at run time, so changing a wire never needs a r
 ## What is in this repository
 
 ```
-KoaOS/            firmware sketch: KoaOS.ino, esp_pkg.h (.esp parser), koaos_abi.h (the ABI), koa_io.h (pin policy)
+KoaOS/            firmware sketch: KoaOS.ino, esp_pkg.h (.esp parser), koaos_abi.h (the ABI), koa_io.h (pin policy),
+                  koaos-merged.bin (prebuilt full flash image of 0.10: bootloader, partition table and KoaOS, written at address 0x0)
 lib/Wasm3/        patched wasm3 Arduino library (MIT, see lib/Wasm3/LICENSE)
 koaos-sdk/        app SDK: headers, mini libc, Makefile, esppack and repo_server tools,
                   example apps (hellowasm, gpswatch, webget, meshcore, iodemo) and native tests
@@ -208,6 +214,10 @@ manifest parser, and the MeshCore crypto and app logic. Apps are built to WebAss
 App memory lives in PSRAM (1 MB per app); the OS and each app's interpreter stack live in internal RAM. wasm3 has no tail
 calls on this chip, so stack use grows with the longest straight-line run of code. The interpreter task gets 48 KB
 (`WASM_TASK_STACK`), and the SDK builds apps with `-Os -fno-unroll-loops` to keep those runs short.
+
+## Links
+
+- Web flasher: [flash.koakno.com](https://flash.koakno.com)
 
 ## Credits
 

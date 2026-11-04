@@ -16,7 +16,7 @@ Status as of release **0.10**.
 | ✅ | OS-managed hardware | `koa_acquire` / `koa_release` for Wi-Fi, GPS, LoRa, display, GPIO, UART, I2C, SPI (ABI 2) |
 | ✅ | Pin policy | firmware allow-list in `koa_io.h`; GPS, radio, OLED, USB and power pins are permanently reserved; one owner per pin; everything released on exit or kill; `pins` shows ownership |
 | ✅ | Capability checks | manifest `requires=` is enforced (`wifi`, `gps`, `lora`, `display`, `gpio`, `uart`, `i2c`, `spi`) |
-| ✅ | MeshCore client | in-app protocol implementation, fully functional |
+| 🟡 | MeshCore client | adverts and channels (public and others) work over the air on a real V4; direct messages crash the system (known bug) |
 
 ## In progress / partly done
 
