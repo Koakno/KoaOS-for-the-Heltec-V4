@@ -1,4 +1,4 @@
-# KoaOS SDK (ABI v2)
+# KoaOS SDK (ABI v3)
 
 Write apps in C, compile them to WebAssembly, pack them as `.esp`, install them on the V4 over Wi-Fi.
 
@@ -41,13 +41,14 @@ type=wasm
 entry=myapp.wasm
 requires=gps,wifi        # only what you use: wifi, gps, lora, display, gpio, uart, i2c, spi
 ```
-`abi=2` is right for anything new. Use `abi=1` only if you want the package to also load on firmware older than 0.10
-(then you cannot use GPIO/UART/I2C/SPI).
+`abi=3` is right for anything that draws on the OLED or uses I2C on the OLED bus; `abi=2` is enough for GPIO/UART/I2C/SPI on your own pins.
+Use `abi=1` only if you want the package to also load on firmware older than 0.10 (then you cannot use GPIO/UART/I2C/SPI).
 Then `make myapp`.
 
 ## API
-Everything in `include/koaos_abi.h` (the OS side implements exactly that list: 48 functions, checked against the firmware's import table) plus helpers from `include/koaos.h`:
-`koa_printf / koa_snprintf / koa_puts / koa_print / koa_putc`, `koa_strerror(err)`, `koa_alive()`.
+Everything in `include/koaos_abi.h` (the OS side implements exactly that list: 56 functions, checked against the firmware's import table) plus helpers from `include/koaos.h`:
+`koa_printf / koa_snprintf / koa_puts / koa_print / koa_putc`, `koa_strerror(err)`, `koa_alive()`, and the I2C / OLED helpers
+`koa_i2c_probe / koa_i2c_scan / koa_i2c_write_reg / koa_i2c_read_reg / koa_oled_printf`.
 There is no libc: use these instead of printf/malloc; only a few string/memory functions exist (`memcpy memmove memset memcmp strlen strcmp strncmp strchr`). Use static buffers.
 
 Rules the OS enforces:
@@ -61,7 +62,7 @@ Rules the OS enforces:
 - The interpreter's own value stack is only 12 KB: keep recursion shallow.
 - wasm3 has no tail calls on the ESP32-S3, so native stack use grows with the longest straight-line run of code (no loops, calls or branches). The firmware gives the interpreter a 48 KB stack (firmware 0.9+). Keep hot functions small, and don't unroll: the Makefile builds with `-Os -fno-unroll-loops`.
 - Apps run at idle priority; they are interpreted, so heavy maths is slow.
-- No command-line arguments yet (the ABI has no call for them), no display drawing, GPIO interrupts, PWM or ADC yet.
+- No command-line arguments yet (the ABI has no call for them), no GPIO interrupts, PWM or ADC yet.
 
 ## GPIO, UART, I2C, SPI (ABI 2)
 The manifest names the *kind* (`requires=gpio,i2c,spi`; `gpio` also covers UART). The app picks the **pins at run time**,
@@ -84,15 +85,45 @@ board). The GPS, radio, OLED and USB pins are never available; use `KC_GPS` / `K
 (`KE_BUSY` for a third), I2C and SPI each have one controller (exclusive). Released or killed apps give everything
 back; pins return to high-impedance input. I2C needs external pull-ups. See `apps/iodemo`.
 
+## The OLED and its I2C bus (ABI 3)
+**Drawing** (`requires=display`, set `abi=3`). The screen is 128x64, 1 bit per pixel, origin top-left.
+```c
+koa_acquire(KC_DISPLAY);                 /* the console stops drawing; the shell still works over USB / VGA */
+koa_oled_clear();
+koa_oled_text(0, 14, KOLED_FONT_LARGE, "KoaOS", KOLED_WHITE);     /* y is the text baseline; fonts: SMALL 5x8, MEDIUM 6x12, LARGE */
+koa_oled_printf(0, 30, KOLED_FONT_SMALL, "temp %d C", t);         /* helper: printf-style, max 63 chars */
+koa_oled_rect(0, 36, 60, 20, /*fill*/ 0, KOLED_WHITE);   koa_oled_line(0, 36, 59, 55, KOLED_WHITE);
+koa_oled_bitmap(100, 40, 8, 8, icon);    /* rows of (w+7)/8 bytes, top bit = leftmost pixel, set bits drawn white */
+koa_oled_flush();                        /* nothing is visible until this */
+```
+Colors: `KOLED_BLACK`, `KOLED_WHITE`, `KOLED_XOR` (draw twice to erase). Everything is clipped. The first draw after you acquire starts from a
+blank screen. The console comes back when you exit or `koa_release(KC_DISPLAY)`. Only one app can hold the display (`KE_BUSY`).
+See `apps/oleddemo`.
+
+**I2C on the OLED's own bus** (`requires=i2c`): open it with the OLED's pins, and wire your chip to the board's SDA/SCL (GPIO17/18),
+3V3 and GND. The pull-ups are already there.
+```c
+koa_acquire(KC_I2C);
+koa_i2c_open(KOA_I2C_OLED_SDA, KOA_I2C_OLED_SCL, 400000);        /* at most 400 kHz on this bus */
+uint8_t found[16]; int n = koa_i2c_scan(found, 16);                /* what answers */
+koa_i2c_write_reg(0x20, 0x06, cfg, 2);   koa_i2c_read_reg(0x20, 0x00, in, 2);
+```
+The OS makes your transfers and the screen updates take turns, so they never collide. The display chip (0x3C / 0x3D) can be probed but not read
+or written (use `koa_oled_*`). `stop=0` writes are held back and sent together with the next read as write + repeated start + read.
+Your own bus on other pins works as before. From the shell, `i2c scan`, `i2c get <addr> [reg] [n]` and `i2c set <addr> <byte>...` use the
+same bus. See `apps/i2cscan` and `apps/pca9555` (a 16-bit GPIO expander).
+
 ## Testing
-`make selftest` checks the SDK's printf against the system libc, `make iotest` checks the pin policy and manifest parser used for GPIO/UART/I2C/SPI, and `make mctest` runs the MeshCore app natively against scripted radio traffic. The apps are compiled to wasm with clang and run on a real V4 (hellowasm, gpswatch, webget, meshcore). If `make` fails on your machine, open an issue with the first error line.
+`make selftest` checks the SDK's printf against the system libc, `make iotest` checks the pin policy and manifest parser used for GPIO/UART/I2C/SPI, `make apptest` runs the OLED / I2C demo apps on this computer against a fake PCA9555 and screen, and `make mctest` runs the MeshCore app natively against scripted radio traffic. Three more tests cover firmware headers rather than apps: `make hidtest` (Bluetooth keyboard report translator), `make rcatest` (RCA video scanline generator) and `make guitest` (renders the desktop to `gui_shots/*.ppm`). The apps are compiled to wasm with clang and run on a real V4 (hellowasm, gpswatch, webget, meshcore). If `make` fails on your machine, open an issue with the first error line.
 
 ## Files
 ```
 include/koaos_abi.h   the ABI (identical to the firmware's)
 include/koaos.h       SDK helpers        src/koaos.c   entry point + mini libc + printf
-apps/                 hellowasm, gpswatch, webget, meshcore, iodemo
+apps/                 hellowasm, gpswatch, webget, meshcore, iodemo, i2cscan, oleddemo, pca9555
 tools/esppack.py      pack/inspect .esp   tools/repo_server.py   install server
-tests/host_test.c     `make selftest`
+tests/host_test.c     `make selftest`          tests/io_test.c    `make iotest`        tests/app_mock.c   `make apptest`
+tests/mc_*            `make mctest`            tests/hid_test.c   `make hidtest`
+tests/rca_host.cpp    `make rcatest`           tests/gui_host.cpp `make guitest`
 ```
 Keep `koaos_abi.h` in sync with the firmware: bump `KOA_ABI_VERSION` only when adding functions.

@@ -1,7 +1,7 @@
 # Roadmap
 
 Where KoaOS is and where it is going. This is a plan, not a promise: priorities change as people use it.
-Status as of release **0.12**.
+Status as of release **0.14** (experimental branch; the stable release is 0.10 on `main`).
 
 **Legend:** ✅ done · 🟡 partly done · ⬜ planned
 
@@ -17,8 +17,12 @@ Status as of release **0.12**.
 | ✅ | Pin policy | firmware allow-list in `koa_io.h`; GPS, radio, OLED, USB and power pins are permanently reserved; one owner per pin; everything released on exit or kill; `pins` shows ownership |
 | ✅ | Capability checks | manifest `requires=` is enforced (`wifi`, `gps`, `lora`, `display`, `gpio`, `uart`, `i2c`, `spi`) |
 | ✅ | VGA text output | `vga on|off`, 640x480, no framebuffer, pins claimed in the pin table and released on `vga off` |
-| ✅ | Graphical desktop | `gui`: 320x240 graphics mode on VGA, launcher, files, editor, Wi-Fi, GPS, system, app launcher; keyboard over USB serial |
-| ✅ | MeshCore client | in-app protocol implementation, fully functional |
+| ✅ | RCA composite output | `rca on|off`, GPIO6, 40x24 text, `gui` uses it when it is on; first tried on a V4 |
+| ✅ | Bluetooth keyboard | `ble`: pairs with a BLE HID keyboard and types into the console, so the shell, editor and desktop work without a PC |
+| ✅ | Graphical desktop | `gui`: 320x240 graphics mode on VGA or RCA, launcher, files, editor, Wi-Fi, GPS, system, app launcher; keys from USB serial or a Bluetooth keyboard |
+| 🟡 | MeshCore client | adverts and channels (public and others) work over the air on a real V4; direct messages crash the system (known bug) |
+| ✅ | Display API for apps | `requires=display`: `koa_oled_*` draws on the OLED; the console steps aside while an app holds it (ABI 3) |
+| ✅ | I2C on the OLED bus | `koa_i2c_open(17, 18, hz)` shares the display's bus (locked, 400 kHz max, display chip protected); `i2c` shell command |
 
 ## In progress / partly done
 
@@ -26,17 +30,17 @@ Status as of release **0.12**.
 |---|---|---|---|
 | 🟡 | Package security | SHA-256 integrity check on every `.esp`; capability enforcement | signatures, and "verified / unknown / corrupt" trust levels |
 | 🟡 | USB and Wi-Fi together | Wi-Fi install works; USB is a serial terminal | installing packages and moving files over USB |
+| 🟡 | RCA color | `rca color on`: NTSC color on the same pin as monochrome, saturation with `rca sat` | marked experimental: needs more testing on real displays |
 | 🟡 | Persistence and recovery | firmware and apps are separate; `uninstall` removes a broken app without reflashing | a dedicated recovery mode beyond reset + shell |
 
 ## Next up (hardware and input)
 
 - ⬜ **GPIO-based drivers.** Apps can already drive pins, UART, I2C and SPI. What is missing is OS-level drivers built on top.
-- ⬜ **I2C keyboard support**, so the board can be used without a USB terminal.
+- ⬜ **I2C keyboard support**, so the board can be used without a USB terminal or Bluetooth.
 - ⬜ **GPIO interrupts / edge waits**, **PWM** and **ADC** for apps.
 - ⬜ **Desktop: windows for installed apps.** A graphics/input API so wasm apps can draw and take keys in the desktop (today they run on the console).
-- ⬜ **Display API for apps.** The `display` capability is reserved in the ABI; apps cannot draw yet.
 - ⬜ Command-line arguments for apps (the ABI has no call for them yet).
-- ⬜ Optional per-app pin lists in the manifest as an extra lock, SPI with several chip-selects, sharing the I2C bus with the OLED.
+- ⬜ Optional per-app pin lists in the manifest as an extra lock, SPI with several chip-selects.
 
 ## Later
 

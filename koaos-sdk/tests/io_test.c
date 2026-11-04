@@ -17,6 +17,12 @@ int main(void) {
     CHECK(!kio_pin_allowed(os[i]));
     CHECK(kio_claim(&t, os[i], 1, KP_GPIO, KG_IN) == KE_PERM);
   }
+  /* the OLED's I2C pair: only ever opened as one shared I2C bus, never claimed pin by pin or in other combinations */
+  CHECK(kio_i2c_is_oled_bus(17, 18) && !kio_i2c_is_oled_bus(18, 17) && !kio_i2c_is_oled_bus(17, 17));
+  CHECK(!kio_i2c_is_oled_bus(4, 5) && !kio_i2c_is_oled_bus(17, 5) && !kio_i2c_is_oled_bus(5, 18));
+  { int oled[2] = { 17, 18 }, mixed[2] = { 4, 18 };
+    CHECK(kio_claim_set(&t, oled, 2, 1, KP_I2C) == KE_PERM && !t.pid[17] && !t.pid[18]);
+    CHECK(kio_claim_set(&t, mixed, 2, 1, KP_I2C) == KE_PERM && !t.pid[4]); }
   CHECK(kio_claim(&t, -1, 1, KP_GPIO, 0) == KE_INVAL && kio_claim(&t, KIO_NPINS, 1, KP_GPIO, 0) == KE_INVAL);
 
 #ifndef KOA_IO_ALLOW_MASK_TEST
@@ -78,7 +84,7 @@ int main(void) {
   CHECK(esp_caps_parse("gpio:4", &caps, err, sizeof(err)) != 0);                                /* pins are NOT in the manifest */
   CHECK(esp_caps_parse("wifi,gps,lora,display", &caps, err, sizeof(err)) == 0 && caps == (KC_WIFI | KC_GPS | KC_LORA | KC_DISPLAY));
   CHECK(esp_caps_parse("", &caps, err, sizeof(err)) == 0 && caps == 0);
-  CHECK(KOA_ABI_VERSION == 2);
+  CHECK(KOA_ABI_VERSION == 3);
 
   printf(fails ? "io_test: %d FAILED\n" : "io_test: all passed\n", fails);
   return fails != 0;

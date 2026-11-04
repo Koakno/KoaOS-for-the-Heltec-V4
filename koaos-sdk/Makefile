@@ -5,7 +5,10 @@
 #   make serve           copy dist/*.esp into repo/ and start the install server
 #   make selftest        test the SDK's printf on this computer (no wasm tools needed)
 #   make iotest          test the pin policy + manifest parser used for GPIO/UART/I2C/SPI (no wasm tools needed)
+#   make apptest         run i2cscan, oleddemo and pca9555 on this computer against a fake PCA9555 + OLED (no wasm tools needed)
 #   make guitest         compile the desktop (KoaOS/koa_gui.h) on this computer and write screenshots to gui_shots/*.ppm
+#   make rcatest         test the composite video generator (KoaOS/koa_rcagen.h) on this computer
+#   make hidtest         test the Bluetooth/USB keyboard report -> terminal bytes translator (KoaOS/koa_hid.h)
 #   make clean
 #
 # Needs: clang with the wasm32 target + wasm-ld (Debian/Ubuntu: apt install clang lld),
@@ -24,7 +27,7 @@ CFLAGS  := --target=wasm32 -mcpu=mvp -Os -fno-unroll-loops -ffreestanding -fno-b
 LDFLAGS := -nostdlib -fuse-ld=lld -Wl,--no-entry -Wl,--gc-sections -Wl,--strip-all \
            -Wl,-z,stack-size=16384 -Wl,--initial-memory=65536 -Wl,--max-memory=524288
 
-.PHONY: all $(APPS) serve selftest mctest iotest guitest clean
+.PHONY: all $(APPS) serve selftest mctest iotest apptest guitest hidtest rcatest clean
 all: $(APPS)
 $(APPS): %: dist/%.esp
 
@@ -62,6 +65,25 @@ mctest:
 	$(PYTHON) tests/mc_app_test.py
 	@rm -f mc_crypto_test mc_app_host
 
+# the I2C / OLED demo apps, natively, against a fake OS (tests/app_mock.c)
+apptest:
+	for a in I2CSCAN:i2cscan OLEDDEMO:oleddemo PCA9555:pca9555; do \
+	  D=$${a%%:*}; N=$${a##*:}; \
+	  gcc -std=gnu11 -Wall -Wextra -Iinclude -DAPP_$$D tests/app_mock.c apps/$$N/main.c src/koaos.c -o app_test_$$N || exit 1; \
+	  echo "== $$N"; ./app_test_$$N || exit 1; \
+	done
+	@rm -f app_test_i2cscan app_test_oleddemo app_test_pca9555
+
+rcatest:
+	g++ -std=c++17 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I../KoaOS tests/rca_host.cpp -o rca_host
+	./rca_host
+	@rm -f rca_host
+
+hidtest:
+	gcc -std=gnu11 -Wall -Wextra -fsanitize=address,undefined tests/hid_test.c -o hid_test
+	./hid_test
+	@rm -f hid_test
+
 guitest:
 	mkdir -p gui_shots
 	g++ -std=gnu++17 -Wall -I../KoaOS tests/gui_host.cpp -o gui_host
@@ -69,4 +91,4 @@ guitest:
 	@rm -f gui_host
 
 clean:
-	rm -rf build dist build_selftest mc_crypto_test mc_app_host io_test io_test_all gui_host gui_shots
+	rm -rf build dist build_selftest mc_crypto_test mc_app_host io_test io_test_all gui_host gui_shots app_test_i2cscan app_test_oleddemo app_test_pca9555

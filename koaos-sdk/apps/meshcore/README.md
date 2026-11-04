@@ -2,7 +2,9 @@
 
 A KoaOS app (wasm, ABI v1) that speaks the MeshCore over-the-air protocol directly through the
 OS's LoRa calls. It is a chat/companion node: it listens, shows who is around, reads and sends
-channel messages, and sends/receives direct messages. It does not repeat other people's traffic.
+channel messages, and (in code) sends/receives direct messages. It does not repeat other people's traffic.
+
+**Known issue:** direct messages currently crash the whole system on a real V4. Adverts and channel messages (public and other channels) work over the air; use channels only until this is fixed.
 
 ## Build and install
 ```
@@ -43,9 +45,9 @@ Ed25519->X25519 ECDH match python-cryptography; the whole app run against script
 built independently in Python from the MeshCore packet/payload docs (adverts, bad signature, channel
 messages, DMs, acks, PATH ack, malformed packets), including what the app transmits.
 
-Also verified: it compiles to wasm and runs on a Heltec V4 (identity creation, UI and commands). Needs firmware 0.9+.
+Also verified on a Heltec V4: it compiles to wasm and runs (identity creation, UI and commands), and adverts and channel messages (public and other channels) work over the air. **Direct messages crash the system on hardware (known bug, being fixed).** Needs firmware 0.9+.
 
-Status: the app is fully functional. Note that the crypto is slow in the interpreter (identity creation and each
+Status: channels work; direct messages do not yet (see above). Note that the crypto is slow in the interpreter (identity creation and each
 advert signature / first DM to a contact take a while); adverts are not signature-checked unless `/verify on`.
 
 Protocol details the app relies on (all adjustable or isolated in main.c): LoRa sync word 0x12 and preamble 16

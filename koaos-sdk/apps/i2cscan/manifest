@@ -1,0 +1,6 @@
+name=i2cscan
+version=1.0
+abi=3
+type=wasm
+entry=i2cscan.wasm
+requires=i2c,display

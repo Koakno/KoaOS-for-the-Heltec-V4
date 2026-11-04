@@ -1,5 +1,5 @@
 /*
- * koaos_abi.h  --  KoaOS application ABI, version 2 (DRAFT)
+ * koaos_abi.h  --  KoaOS application ABI, version 3 (DRAFT)
  *
  * One header, two readers:
  *   - the SDK compiles apps against it (functions become wasm imports from
@@ -17,7 +17,8 @@
 
 #include <stdint.h>
 
-#define KOA_ABI_VERSION 2   /* 2 = adds GPIO / UART / I2C / SPI. Apps built for ABI 1 run unchanged. */
+#define KOA_ABI_VERSION 3   /* 3 = adds drawing on the OLED and I2C on the OLED bus. 2 = GPIO / UART / I2C / SPI.
+                               Apps built for ABI 1 or 2 run unchanged. */
 
 #ifdef __wasm__
 #define KFN(ret, name, args) \
@@ -152,11 +153,24 @@ KFN(int32_t,  koa_uart_close,   (int32_t h))
 KFN(int32_t,  koa_uart_write,   (int32_t h, const void *buf, int32_t n))                  /* returns n */
 KFN(int32_t,  koa_uart_read,    (int32_t h, void *buf, int32_t nmax, int32_t timeout_ms)) /* bytes available, 0 on timeout */
 
-/* ---- I2C controller (KC_I2C; exclusive; own bus, separate from the OLED; needs external pull-ups) ---- */
+/* ---- I2C controller (KC_I2C; exclusive: one app at a time; manifest requires=i2c) ----
+ * Two kinds of bus, chosen by the pins you open:
+ *   - your own bus on two allowed pins (see `pins` in the shell). It needs external pull-ups.
+ *   - the OLED bus: koa_i2c_open(KOA_I2C_OLED_SDA, KOA_I2C_OLED_SCL, hz). The display and your app share these wires:
+ *       * the OS serializes every transfer, so yours never lands in the middle of a screen update
+ *       * hz is at most 400000; after each of your transfers the bus goes back to the display's 400 kHz
+ *       * the pull-ups are already on the board
+ *       * the OLED itself (addresses 0x3C and 0x3D) can be probed but not read or written: use koa_oled_* for it
+ *       * stop=0 is emulated: the write is held back and sent together with the read that follows it
+ *         (write, repeated start, read). If anything else comes first, the held write is sent with a normal stop.
+ *         koa_i2c_close drops a held write.
+ * The same applies to both buses: addr 0x08..0x77, n <= 128, and n = 0 probes an address (0 = ACK, KE_NOENT = nobody there). */
+#define KOA_I2C_OLED_SDA 17
+#define KOA_I2C_OLED_SCL 18
 KFN(int32_t,  koa_i2c_open,     (int32_t sda, int32_t scl, int32_t freq_hz))
 KFN(int32_t,  koa_i2c_close,    (void))
-KFN(int32_t,  koa_i2c_write,    (int32_t addr, const void *buf, int32_t n, int32_t stop))  /* addr 0x08..0x77, n<=128; n=0 probes (KE_NOENT = no ACK); stop=0 keeps the bus for a read */
-KFN(int32_t,  koa_i2c_read,     (int32_t addr, void *buf, int32_t n))                      /* n<=128, returns bytes */
+KFN(int32_t,  koa_i2c_write,    (int32_t addr, const void *buf, int32_t n, int32_t stop))  /* returns n; stop=0 keeps the bus for the read that follows */
+KFN(int32_t,  koa_i2c_read,     (int32_t addr, void *buf, int32_t n))                      /* returns bytes */
 
 /* ---- SPI controller (KC_SPI; exclusive; own bus, separate from the radio) ---- */
 #define KSPI_MODE0    0
@@ -168,6 +182,34 @@ KFN(int32_t,  koa_spi_open,     (int32_t sck, int32_t mosi, int32_t miso, int32_
 KFN(int32_t,  koa_spi_close,    (void))
 KFN(int32_t,  koa_spi_transfer, (const void *tx, void *rx, int32_t n, int32_t flags))  /* n<=256; tx or rx may be NULL; returns n */
 
-/* reserved for later: display/buttons, GPIO interrupts */
+/* ============ OLED (ABI 3; KC_DISPLAY; manifest requires=display; exclusive) ============
+ * The 128x64 monochrome screen. Origin is top-left, x grows to the right, y grows downward.
+ * Acquire it first:  koa_acquire(KC_DISPLAY).  While an app holds the display the console stops drawing on it (the shell
+ * still works over USB and VGA); when the app exits or calls koa_release(KC_DISPLAY) the console comes back.
+ * You draw into an off-screen buffer and nothing is visible until koa_oled_flush(). Your first draw after acquiring starts
+ * from a blank buffer. Drawing is clipped to the screen.
+ * Every function returns KE_OK (or a size), KE_PERM if the display was not acquired, KE_INVAL for bad arguments.
+ * Coordinates for pixel / line / rect may be anywhere in -1024..1024 (the part off the screen is clipped); bigger is KE_INVAL. */
+#define KOLED_W       128
+#define KOLED_H       64
+#define KOLED_BLACK   0    /* draw color: clear pixels */
+#define KOLED_WHITE   1    /* set pixels */
+#define KOLED_XOR     2    /* invert pixels (draw twice to erase) */
+#define KOLED_FONT_SMALL  0   /* 5x8: 25 columns x 8 rows, the console's font */
+#define KOLED_FONT_MEDIUM 1   /* 6x12 */
+#define KOLED_FONT_LARGE  2   /* Helvetica bold, about 14 pixels tall */
+KFN(int32_t,  koa_oled_clear,    (void))                                               /* blank the buffer */
+KFN(int32_t,  koa_oled_flush,    (void))                                               /* show the buffer (takes a few ms) */
+KFN(int32_t,  koa_oled_pixel,    (int32_t x, int32_t y, int32_t color))
+KFN(int32_t,  koa_oled_line,     (int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t color))
+KFN(int32_t,  koa_oled_rect,     (int32_t x, int32_t y, int32_t w, int32_t h, int32_t fill, int32_t color))   /* w,h >= 0; fill 0 = outline */
+KFN(int32_t,  koa_oled_text,     (int32_t x, int32_t y, int32_t font, const char *s, int32_t color))   /* y = baseline, 0..127; x 0..127; s up to 63 chars;
+                                                                                                          the text is drawn without a background; returns its width in pixels */
+KFN(int32_t,  koa_oled_bitmap,   (int32_t x, int32_t y, int32_t w, int32_t h, const void *bits))   /* w 1..128, h 1..64; rows top to bottom, each row is
+                                                                                                          (w+7)/8 bytes, the top bit of a byte is the leftmost pixel;
+                                                                                                          set bits are drawn white, clear bits are left alone */
+KFN(int32_t,  koa_oled_contrast, (int32_t level))                                      /* 0..255; the OS puts the default back when you let go of the display */
+
+/* reserved for later: buttons, GPIO interrupts */
 
 #endif /* KOAOS_ABI_H */

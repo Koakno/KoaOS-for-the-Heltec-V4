@@ -1,0 +1,6 @@
+name=pca9555
+version=1.0
+abi=3
+type=wasm
+entry=pca9555.wasm
+requires=i2c,display

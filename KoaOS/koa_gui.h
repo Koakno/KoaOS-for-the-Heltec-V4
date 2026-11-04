@@ -1,7 +1,7 @@
 /*
- * koa_gui.h -- the KoaOS graphical environment ("gui" command), drawn on the VGA output.
+ * koa_gui.h -- the KoaOS graphical environment ("gui" command), drawn on the VGA output, or on the RCA composite output when "rca on" is running.
  *
- *   gui            start it (turns VGA on by itself if needed)           gui boot on|off   start it at every boot
+ *   gui            start it (uses RCA if it is on; otherwise turns VGA on by itself)     gui boot on|off   start it at every boot
  *
  * 320x240 pixels, 8 colors (koa_gfx.h), doubled to 640x480. Controlled with the keys you type in the USB serial terminal:
  *   arrow keys move, Enter opens, Esc goes back / opens the power menu, Ctrl-C leaves the GUI at once.
@@ -527,7 +527,7 @@ static void guiSystem() {
     else snprintf(l, sizeof(l), "Wi-Fi   not connected");
     guiRow(5, l);
     snprintf(l, sizeof(l), "GPS     %s", !g.on ? "off" : g.locValid ? "fix" : "no fix"); guiRow(6, l);
-    guiRow(7, "Video   VGA 640x480, GUI 320x240");
+    guiRow(7, rcaActive() ? "Video   RCA composite, GUI 320x240" : "Video   VGA 640x480, GUI 320x240");
     guiRow(8, "");
     guiRow(9, "PID  NAME          FLAGS", false, C_BLU);
     int row = 10;
@@ -736,7 +736,7 @@ int p_gui(int argc, char** argv) {
   if (argc > 1) { pr("usage: gui | gui boot on|off\n"); return 1; }
   if (guiPid) { pr("gui: already running\n"); return 1; }
   bool ownVga = false;
-  if (!vgaActive()) {
+  if (!vgaActive() && !rcaActive()) {            // RCA running: the desktop goes to the composite output, VGA stays untouched/off
     const char* who = "?";
     int r = vgaEnable(&who);
     if (r == KE_BUSY) { prf("gui: vga pins busy (held by %s, see: pins)\n", who); return 1; }

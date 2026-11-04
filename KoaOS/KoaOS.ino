@@ -18,7 +18,9 @@
 #include "koaos_abi.h"   // shared with the SDK: error codes, KC_* capabilities, API structs
 #include "esp_pkg.h"        // .esp package format: parser, manifest, sha-256 (portable, unit-tested on a PC)
 #include "koa_vga.h"        // VGA text + 320x240 graphics output, switched on/off at run time with the "vga" command (wiring in koa_vga.h)
+#include "koa_rca.h"        // RCA composite video on GPIO6 (same text buffer and framebuffer as VGA), switched with the "rca" command (wiring in koa_rca.h)
 #include "koa_io.h"         // pin allow-list + pin ownership table for app GPIO/UART/I2C/SPI (portable, unit-tested on a PC)
+#include "koa_ble.h"        // Bluetooth LE keyboard for the console, off until "ble on" (needs NimBLE-Arduino 2.5.1; #define KOA_NO_BLE leaves it out)
 #include <driver/gpio.h>   // gpio_set_level: preset an output latch before the pin becomes an output
 
 HWCDC USBSerial;
@@ -26,7 +28,7 @@ HWCDC USBSerial;
 
 #define OSNAME       "KoaOS"
 #define HOSTNAME     "koa"   // prompt/login/neofetch hostname
-#define OSVER        "0.12"
+#define OSVER        "0.14"
 #define LOGIN_USER   "root"
 #define LOGIN_PASS   "1234"
 
@@ -83,6 +85,27 @@ enum { FD_NONE, FD_TTY, FD_FILE, FD_NULL, FD_GPS };
 enum { P_RUN = 1, P_ZOMBIE = 2 };
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
+
+// ---- the OLED and its I2C bus (Wire, GPIO17/18) ----
+// Two kinds of user share them: the kernel's own drawing (console, editor, gps view, ...) and apps (koa_oled_* to draw,
+// koa_i2c_open(17, 18, ...) for chips that sit on the same two wires, such as a GPIO expander). One recursive lock covers
+// the frame buffer AND the bus, so a screen update and an app's I2C transfer never interleave.
+// Lock order: ttyMx (if held) -> oledMx. Never call anything that takes ttyMx (prf, pr, sys_write) while holding oledMx.
+SemaphoreHandle_t oledMx = NULL;                 // created first thing in setup()
+volatile bool dispApp = false;                   // an app (not the console) owns the screen
+volatile bool oledAppFresh = false;              // the app just got the screen: its first draw starts from a blank buffer
+volatile bool oledContrastDirty = false;         // an app changed the contrast; the main loop puts the default back
+#define OLED_BUS_HZ    400000                    // what the OLED runs at; also the most an app may ask for on this bus
+#define OLED_CONTRAST  0xCF                      // U8g2's default for this panel
+
+struct OledLock {                                // holds the OLED lock until the end of the scope
+  OledLock()  { if (oledMx) xSemaphoreTakeRecursive(oledMx, portMAX_DELAY); }
+  ~OledLock() { if (oledMx) xSemaphoreGiveRecursive(oledMx); }
+};
+struct OledGfx : OledLock {                      // for the kernel's own drawing: ok == false means an app owns the screen, so don't draw
+  bool ok;
+  OledGfx() : ok(!dispApp) {}
+};
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
 
@@ -143,6 +166,23 @@ void wasmReaper();
 bool wasmAvailable();
 void ipcDropAll(int pid);
 int  p_wasm(int, char**);
+
+// NOTE: keep this *after* struct FD / struct Proc. The Arduino builder inserts its auto-generated
+// prototypes before the first function definition in the file; a function above the structs
+// makes every prototype that mentions FD/Proc fail to compile.
+static void oledFlush() { OledLock l; display.sendBuffer(); }   // every kernel-side screen update goes through here
+// Seen on the V4.3: after a transfer that got no ACK, the next transfer reports success even when nobody answers, so a scan
+// shows every other address. These two wrappers send one throw-away probe after a failure to use up that stale result.
+static uint8_t i2cEnd(TwoWire& w, uint8_t addr, bool stop) {
+  uint8_t e = w.endTransmission(stop);
+  if (e != 0) { w.beginTransmission(addr); w.endTransmission(true); }
+  return e;
+}
+static size_t i2cReq(TwoWire& w, uint8_t addr, size_t n) {
+  size_t got = w.requestFrom((uint16_t)addr, n, true);
+  if (got == 0) { w.beginTransmission(addr); w.endTransmission(true); }
+  return got;
+}
 
 Proc procs[MAXPROC];
 int nextPid = 1;
@@ -293,11 +333,12 @@ void ttyInputChar(char c) {
 }
 
 void drawTerm() {
+  OledGfx og; if (!og.ok) return;
   display.clearBuffer();
   display.setFont(u8g2_font_5x8_tr);
   for (int r = 0; r < ROWS; r++) display.drawStr(0, r * 8 + 7, scr[r]);
   if (blinkOn) display.drawBox(curCol * 5, curRow * 8, 4, 7);
-  display.sendBuffer();
+  oledFlush();
 }
 
 void kprintf(const char* fmt, ...) {
@@ -787,7 +828,7 @@ int sys_lora_rx(void* buf, int nmax, int timeout_ms, float* rssi, float* snr) {
 // Apps pick PINS at run time; the manifest only says which KINDS of I/O they may use (gpio, i2c, spi; gpio includes uart).
 // Policy (which pins an app may ever touch) and ownership live in koa_io.h; this section does the hardware part.
 //   GPIO  shared capability, pins claimed one by one          UART  2 ports, any pins (GPIO matrix)
-//   I2C   exclusive: Wire1 (the OLED keeps Wire)              SPI   exclusive: HSPI (the radio keeps SPI)
+//   I2C   exclusive: Wire1 on pins the app names, or Wire on 17/18 shared with the OLED     SPI   exclusive: HSPI (the radio keeps SPI)
 // The GPS and the radio are NOT reachable through this: their pins are permanently off-limits to apps (koa_io.h) and
 // they are only available through the gps / lora capabilities. GPS stays shared (any number of apps, receive-only).
 // The two app UARTs use hardware UART2 and UART0 (UART1 belongs to the GPS driver and is never handed out). UART0's
@@ -799,6 +840,9 @@ static HardwareSerial appUart0(0);
 struct UartSlot { bool open; int pid; int rx, tx; };
 static UartSlot uartSlot[2];
 static int  i2cOwner = 0;  static bool i2cOpen = false;
+static bool i2cShared = false;                    // the app's session is on the OLED bus (Wire, GPIO17/18), not on Wire1
+static uint32_t i2cFreq = OLED_BUS_HZ;            // clock the app asked for (shared bus: <= OLED_BUS_HZ)
+static struct { bool valid; uint8_t addr; uint8_t n; uint8_t data[128]; } i2cPend;   // shared bus: a write with stop=0, held for the read after it
 static int  spiOwner = 0;  static bool spiOpen = false;
 static int  spiCs = -1;    static bool spiCsHeld = false;
 static uint32_t spiFreq = 1000000; static uint8_t spiModeSel = SPI_MODE0;
@@ -824,11 +868,16 @@ static void ioPinsRelease(int pid, int kind) {
   }
 }
 
-// shuts the app I2C bus (Wire1) and frees its pins. Caller holds resMx.
+// ends the app's I2C session. Own bus (Wire1): shut it and free its pins. OLED bus: nothing to free, it belongs to the display.
+// Caller holds resMx.
 static void i2cShutdown(int pid) {
-  if (i2cOpen) Wire1.end();
-  i2cOpen = false;
-  ioPinsRelease(pid, KP_I2C);
+  if (i2cOpen && i2cShared) {
+    i2cPend.valid = false;
+  } else {
+    if (i2cOpen) Wire1.end();
+    ioPinsRelease(pid, KP_I2C);
+  }
+  i2cOpen = false; i2cShared = false;
 }
 
 // shuts the app SPI bus (HSPI) and frees its pins, CS included. Caller holds resMx.
@@ -879,7 +928,10 @@ int resAcquire(uint32_t cap) {
     else { rc = loraHwOn(); if (rc == KE_OK) { loraOwner = p->pid; p->held |= cap; } }
   } else if (cap == KC_DISPLAY) {
     if (dispOwner) rc = KE_BUSY;
-    else { dispOwner = p->pid; p->held |= cap; }
+    else {
+      dispOwner = p->pid; p->held |= cap;
+      if (p->wctx) { oledAppFresh = true; dispApp = true; }   // a wasm app: the console stops drawing; its first draw starts blank
+    }
   } else if (cap == KC_WIFI) {
     p->held |= cap;                 // shared; only gates koa_http_get / koa_wifi_status
   } else if (cap == KC_GPIO || cap == KC_UART) {
@@ -907,7 +959,7 @@ static int resReleaseP(Proc* p, uint32_t cap) {
   } else if (cap == KC_LORA) {
     if (loraOwner == p->pid) { loraOwner = 0; loraHwOff(); }
   } else if (cap == KC_DISPLAY) {
-    if (dispOwner == p->pid) dispOwner = 0;
+    if (dispOwner == p->pid) { dispOwner = 0; dispApp = false; dirty = true; }   // the console takes the screen back
   } else if (cap == KC_GPIO) {
     ioPinsRelease(p->pid, KP_GPIO);
   } else if (cap == KC_UART) {
@@ -956,12 +1008,14 @@ int readline(char* buf, int max) {
 // (so apps cannot use them meanwhile, and "vga on" refuses to start if something else holds one),
 // then starts the LCD peripheral. "vga off" stops it and releases the pins. No framebuffer, nothing in PSRAM.
 #define VGA_PID        (-78)   // owner id of the VGA pins in the pin table
+#define RCA_PID        (-79)   // owner id of the RCA pins in the pin table (RCA section below)
 #define VGA_BOOT_FILE  "/config/vga"   // exists = start VGA at boot
 
 static const int vgaPinList[6] = { VGA_PIN_R, VGA_PIN_G, VGA_PIN_B, VGA_PIN_HSYNC, VGA_PIN_VSYNC, VGA_PIN_PCLK };
 
 static const char* pinWho(int pid) {            // who holds a pin, for "pins" and error messages
   if (pid == VGA_PID) return "vga";
+  if (pid == RCA_PID) return "rca";
   for (int j = 0; j < MAXPROC; j++) if (procs[j].used && procs[j].pid == pid) return procs[j].name;
   return "?";
 }
@@ -1004,9 +1058,79 @@ static void vgaBootSet(bool on) {
   else sys_unlink(VGA_BOOT_FILE);
 }
 
+// ================= RCA composite video (run-time switch) =================
+// koa_rca.h does the video; this section owns the pins, exactly like the VGA section above. "rca on" claims GPIO 6 (video) and 3 (dummy clock)
+// under RCA_PID. GPIO3 and GPIO6 are also VGA pins, so VGA and RCA exclude each other: whoever starts first holds them and the
+// other one gets "pins busy (held by ...)". "rca off" stops the LCD peripheral and releases the pins.
+#define RCA_BOOT_FILE  "/config/rca"      // exists = start RCA at boot
+#define RCA_COLOR_FILE "/config/rcacolor" // exists = experimental NTSC color mode (applies at the next "rca on")
+#define RCA_POS_FILE   "/config/rcapos"   // the picture position (first row of the 240-row window), set with "rca pos"
+
+static const int rcaPinList[2] = { RCA_PIN_VIDEO, RCA_PIN_PCLK };
+
+static void rcaPosLoad() {
+  int fd = sys_open(RCA_POS_FILE, K_RD);
+  if (fd < 0) return;
+  char b[8]; int n = sys_read(fd, b, 7);
+  sys_close(fd);
+  if (n > 0) { b[n] = 0; int v = atoi(b); if (v >= RCA_TOP_MIN && v <= RCA_TOP_MAX) rcaTop = v; }
+}
+static bool rcaColorFlag() { int fd = sys_open(RCA_COLOR_FILE, K_RD); if (fd < 0) return false; sys_close(fd); return true; }
+static void rcaColorSet(bool on) {
+  if (on) { int fd = sys_open(RCA_COLOR_FILE, K_WR); if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); } }
+  else sys_unlink(RCA_COLOR_FILE);
+}
+
+static void rcaPosSave() {
+  int fd = sys_open(RCA_POS_FILE, K_WR);
+  if (fd < 0) return;
+  char b[8]; int n = snprintf(b, sizeof(b), "%d", (int)rcaTop);
+  sys_write(fd, b, n); sys_close(fd);
+}
+
+// returns KE_OK, KE_BUSY (a pin is taken, for instance by VGA: *who names the holder) or KE_IO (the LCD driver would not start)
+static int rcaEnable(const char** who) {
+  if (rcaActive()) return KE_OK;
+  xSemaphoreTake(resMx, portMAX_DELAY);
+  int rc = kio_claim_set_sys(&ioPins, rcaPinList, 2, RCA_PID, KP_GPIO);
+  if (rc == KE_BUSY && who) {
+    *who = "?";
+    for (int i = 0; i < 2; i++) if (ioPins.pid[rcaPinList[i]]) { *who = pinWho(ioPins.pid[rcaPinList[i]]); break; }
+  }
+  xSemaphoreGive(resMx);
+  if (rc != KE_OK) return rc;
+  rcaPosLoad();
+  rcaColor = rcaColorFlag();                     // color or monochrome: the LCD timing differs, so it is fixed while RCA runs
+  xSemaphoreTake(ttyMx, portMAX_DELAY);          // vgaPut() runs under ttyMx, so start/stop under it too
+  bool ok = rcaBegin();
+  xSemaphoreGive(ttyMx);
+  if (!ok) {
+    xSemaphoreTake(resMx, portMAX_DELAY);
+    ioPinsRelease(RCA_PID, KP_GPIO);
+    xSemaphoreGive(resMx);
+    return KE_IO;
+  }
+  return KE_OK;
+}
+
+static void rcaDisable() {
+  xSemaphoreTake(ttyMx, portMAX_DELAY);
+  rcaEnd();
+  xSemaphoreGive(ttyMx);
+  xSemaphoreTake(resMx, portMAX_DELAY);
+  ioPinsRelease(RCA_PID, KP_GPIO);
+  xSemaphoreGive(resMx);
+}
+
+static bool rcaBootFlag() { int fd = sys_open(RCA_BOOT_FILE, K_RD); if (fd < 0) return false; sys_close(fd); return true; }
+static void rcaBootSet(bool on) {
+  if (on) { int fd = sys_open(RCA_BOOT_FILE, K_WR); if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); } }
+  else sys_unlink(RCA_BOOT_FILE);
+}
+
 // ================= PROGRAMS =================
 int p_help(int, char**) {
-  pr("help clear uname uptime\nfree df ls cat rm echo\ndate whoami reboot gps\nedit <file> neofetch\nps kill sleep exit pins\nwifi aprs aprsd weather\nrun install uninstall apps\nvga on|off gui\nuse > >> and & in sh\n");
+  pr("help clear uname uptime\nfree df ls cat rm echo\ndate whoami reboot gps\nedit <file> neofetch\nps kill sleep exit pins\nwifi aprs aprsd weather\nrun install uninstall apps\nvga on|off rca gui ble i2c\nuse > >> and & in sh\n");
   return 0;
 }
 
@@ -1041,8 +1165,86 @@ int p_pins(int, char**) {                       // what apps may use, and who ho
     prf("%2d %-4s %s\n", i, kn[ioPins.kind[i] <= KP_SPI ? ioPins.kind[i] : 0], who);
     n++;
   }
+  if (i2cOpen && i2cShared) { prf("17,18 i2c %s (shared with the OLED)\n", pinWho(i2cOwner)); n++; }
   if (!n) pr("none in use\n");
   return 0;
+}
+
+// i2c scan | i2c get <addr> [reg] [count] | i2c set <addr> <byte>...     (numbers in hex, except count; always the OLED bus, GPIO17/18)
+// For checking wiring without writing an app. Results are collected under the OLED lock and printed after it is let go.
+static long i2cHex(const char* t) { char* e; long v = strtol(t, &e, 16); return (t[0] && !*e && v >= 0) ? v : -1; }
+
+int p_i2c(int argc, char** argv) {
+  const char* a = argc > 1 ? argv[1] : "";
+  if (!strcmp(a, "scan")) {
+    uint8_t hit[112], rep[112]; int nh = 0;
+    int sdaIdle, sclIdle;
+    {
+      OledLock lk;
+      sdaIdle = gpio_get_level((gpio_num_t)OLED_SDA);          // both lines should read 1 (pulled up) when nobody is talking
+      sclIdle = gpio_get_level((gpio_num_t)OLED_SCL);
+      Wire.setClock(100000);
+      for (int ad = 0x08; ad <= 0x77; ad++) {
+        Wire.beginTransmission((uint8_t)ad);
+        if (i2cEnd(Wire, (uint8_t)ad, true) != 0) continue;
+        int ok = 1;                                             // a real device answers every time: ask twice more
+        for (int r = 0; r < 2; r++) { Wire.beginTransmission((uint8_t)ad); if (i2cEnd(Wire, (uint8_t)ad, true) == 0) ok++; }
+        hit[nh] = (uint8_t)ad; rep[nh] = (uint8_t)ok; nh++;
+      }
+      Wire.setClock(OLED_BUS_HZ);
+    }
+    prf("bus idle: SDA=%d SCL=%d%s\n", sdaIdle, sclIdle, (sdaIdle && sclIdle) ? "" : "   <-- a line is held low: short, bad power, or a stuck device");
+    for (int i = 0; i < nh; i++) prf("0x%02x%s%s\n", hit[i], rep[i] < 3 ? (rep[i] == 2 ? "  (answered 2/3: unreliable)" : "  (answered 1/3: unreliable)") : "", (hit[i] == 0x3C || hit[i] == 0x3D) ? "  (the OLED)" : "");
+    if (nh > 12) prf("%d addresses answered: that is not real hardware, the bus itself is faulty\n", nh);
+    if (!nh) pr("nothing answered\n");
+    return 0;
+  }
+  if (!strcmp(a, "get") && argc >= 3) {
+    long ad = i2cHex(argv[2]);
+    long reg = argc >= 4 ? i2cHex(argv[3]) : -1;
+    long n = argc >= 5 ? strtol(argv[4], NULL, 10) : 1;
+    if (ad < 0x08 || ad > 0x77 || (argc >= 4 && (reg < 0 || reg > 255)) || n < 1 || n > 32) { pr("usage: i2c get <addr> [reg] [count]\n"); return 1; }
+    uint8_t buf[32]; int got = 0; bool ok = true;
+    {
+      OledLock lk;
+      Wire.setClock(100000);
+      if (argc >= 4) { Wire.beginTransmission((uint8_t)ad); Wire.write((uint8_t)reg); ok = i2cEnd(Wire, (uint8_t)ad, false) == 0; }
+      if (ok) {
+        size_t want = i2cReq(Wire, (uint8_t)ad, (size_t)n);
+        while (got < (int)want && got < 32 && Wire.available()) buf[got++] = (uint8_t)Wire.read();
+      }
+      Wire.setClock(OLED_BUS_HZ);
+    }
+    if (!ok || !got) { pr("i2c: no answer\n"); return 1; }
+    for (int i = 0; i < got; i++) prf("%02x%c", buf[i], i + 1 < got ? ' ' : '\n');
+    return 0;
+  }
+  if (!strcmp(a, "set") && argc >= 4) {
+    long ad = i2cHex(argv[2]);
+    int n = argc - 3;
+    if (ad < 0x08 || ad > 0x77 || n > 16) { pr("usage: i2c set <addr> <byte>...\n"); return 1; }
+    if (ad == 0x3C || ad == 0x3D) { pr("i2c: that is the OLED itself\n"); return 1; }
+    uint8_t buf[16];
+    for (int i = 0; i < n; i++) {
+      long v = i2cHex(argv[3 + i]);
+      if (v < 0 || v > 255) { pr("usage: i2c set <addr> <byte>...\n"); return 1; }
+      buf[i] = (uint8_t)v;
+    }
+    uint8_t e;
+    {
+      OledLock lk;
+      Wire.setClock(100000);
+      Wire.beginTransmission((uint8_t)ad);
+      Wire.write(buf, (size_t)n);
+      e = i2cEnd(Wire, (uint8_t)ad, true);
+      Wire.setClock(OLED_BUS_HZ);
+    }
+    if (e) { prf("i2c: error %d (2 = nobody answered)\n", (int)e); return 1; }
+    pr("ok\n");
+    return 0;
+  }
+  pr("usage: i2c scan\n  i2c get <addr> [reg] [count]\n  i2c set <addr> <byte>...\n(hex, the OLED bus: GPIO17/18)\n");
+  return 1;
 }
 
 int p_vga(int argc, char** argv) {              // vga on|enabled | off|disabled | status | boot on|off
@@ -1071,6 +1273,161 @@ int p_vga(int argc, char** argv) {              // vga on|enabled | off|disabled
   }
   pr("usage: vga on|off|status|boot on|off\n(also: vga enabled / vga disabled)\n");
   return 1;
+}
+
+int p_rca(int argc, char** argv) {              // rca [on] | off | status | boot on|off | test | pos [n]
+  const char* a = argc > 1 ? argv[1] : "on";
+  if (!strcmp(a, "on") || !strcmp(a, "enable") || !strcmp(a, "enabled")) {
+    if (rcaActive()) { pr("rca already on\n"); return 0; }
+    const char* who = "?";
+    int r = rcaEnable(&who);
+    if (r == KE_BUSY) { prf("rca: pins busy (held by %s, see: pins)\n", who); return 1; }
+    if (r != KE_OK) { pr("rca: could not start the video driver\n"); return 1; }
+    prf("rca on: composite video on GPIO%d (GPIO%d unused clock pin), text 40x24, gui 320x240\n", RCA_PIN_VIDEO, RCA_PIN_PCLK);
+    return 0;
+  }
+  if (!strcmp(a, "off") || !strcmp(a, "disable") || !strcmp(a, "disabled")) {
+    if (!rcaActive()) { pr("rca already off\n"); return 0; }
+    if (guiPid) { pr("rca: the gui is running (leave it first)\n"); return 1; }
+    rcaDisable();
+    pr("rca off: pins released\n");
+    return 0;
+  }
+  if (!strcmp(a, "status")) { prf("rca: %s, start at boot: %s, picture position %d, drive %d, black 0x%X, color %s (saved: %s), sat %d\n", rcaActive() ? "on" : "off", rcaBootFlag() ? "yes" : "no", (int)rcaTop, (int)rcaDrive, (int)rcaBlackNib, rcaColor ? "on" : "off", rcaColorFlag() ? "on" : "off", (int)rcaSat); return 0; }
+  if (!strcmp(a, "color")) {                     // EXPERIMENTAL NTSC color: rca color on|off (restarts the output if it is running)
+    if (argc > 2 && (!strcmp(argv[2], "on") || !strcmp(argv[2], "off"))) {
+      bool want = !strcmp(argv[2], "on");
+      rcaColorSet(want);
+      if (rcaActive() && rcaColor != want) {
+        if (guiPid) { prf("rca color %s saved; leave the gui, then: rca off, rca on\n", want ? "on" : "off"); return 0; }
+        rcaDisable();
+        const char* who = "?";
+        int r = rcaEnable(&who);
+        if (r != KE_OK) { pr("rca: could not restart the video driver (type: rca on)\n"); return 1; }
+      }
+      prf("rca color %s%s\n", want ? "on" : "off", rcaActive() ? "" : " (applies at the next: rca on)");
+    } else prf("rca color is %s (usage: rca color on|off)\n", rcaColorFlag() ? "on" : "off");
+    return 0;
+  }
+  if (!strcmp(a, "sat")) {                       // color saturation in percent (color mode only), 0..150
+    if (argc > 2) {
+      int v = atoi(argv[2]);
+      if (v < 0 || v > 150) { pr("rca: sat must be 0..150\n"); return 1; }
+      rcaSat = v;
+      if (rcaActive() && rcaColor) rccGenInit();
+    }
+    prf("rca sat %d (0..150, default 60)\n", (int)rcaSat);
+    return 0;
+  }
+  if (!strcmp(a, "drive")) {                     // GPIO6 output strength 0..3 (3 = strongest, default)
+    if (argc > 2) {
+      int v = atoi(argv[2]);
+      if (v < 0 || v > 3) { pr("rca: drive must be 0..3\n"); return 1; }
+      rcaDrive = v;
+      if (rcaActive()) rcaApplyDrive();
+    }
+    prf("rca drive %d (0..3, 3 = strongest)\n", (int)rcaDrive);
+    return 0;
+  }
+  if (!strcmp(a, "black")) {                     // black level as a 4 bit pattern: 5 = 50%% (default), 4 = 25%%, 6 = 50%%-ish, 2 = 25%%
+    if (argc > 2) {
+      int v = atoi(argv[2]);
+      if (v < 2 || v > 6) { pr("rca: black must be 2..6 (5 = default, 4 = darker)\n"); return 1; }
+      rcaBlackNib = (uint8_t)v;
+      if (rcaActive()) rcaGenInit();
+    }
+    prf("rca black %d (pattern 0x%X)\n", (int)rcaBlackNib, (int)rcaBlackNib);
+    return 0;
+  }
+  if (!strcmp(a, "boot") && argc > 2 && (!strcmp(argv[2], "on") || !strcmp(argv[2], "off"))) {
+    rcaBootSet(!strcmp(argv[2], "on"));
+    prf("rca will %sstart at boot\n", !strcmp(argv[2], "on") ? "" : "not ");
+    return 0;
+  }
+  if (!strcmp(a, "test")) {                      // bring-up pattern: gray bars, one-pixel columns, white frame around the 320x240 window
+    if (!rcaActive()) { pr("rca: not on (type: rca on)\n"); return 1; }
+    rcaTest = !rcaTest;
+    prf("rca test pattern %s\n", rcaTest ? "on (type rca test again to leave it)" : "off");
+    return 0;
+  }
+  if (!strcmp(a, "pos")) {                       // first row of the 240-row picture window: smaller = picture higher
+    if (argc > 2) {
+      int v = atoi(argv[2]);
+      if (v < RCA_TOP_MIN || v > RCA_TOP_MAX) { prf("rca: pos must be %d..%d\n", RCA_TOP_MIN, RCA_TOP_MAX); return 1; }
+      rcaTop = v;
+      rcaPosSave();
+    }
+    prf("rca pos %d (%d..%d, one step = one scanline)\n", (int)rcaTop, RCA_TOP_MIN, RCA_TOP_MAX);
+    return 0;
+  }
+  pr("usage: rca [on]|off|status|boot on|off|test|pos <n>|drive <0-3>|black <2-6>|color on|off|sat <n>\n(composite on GPIO6; shares its pins with vga, so one at a time)\n");
+  return 1;
+}
+
+#ifndef KOA_NO_BLE
+static bool bleWaitIdle(Proc* me, int ms) {      // wait for the BLE task to finish a request (Ctrl-C leaves, the task carries on)
+  for (int t = 0; t < ms; t += 50) {
+    if (!bleReq) return true;
+    if (me && me->killed) return false;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return false;
+}
+static bool bleEnsureUp(Proc* me) {              // start the stack if needed and wait until it is ready
+  bleEnable(true);
+  for (int t = 0; t < 5000 && !bleInited; t += 50) { if (me && me->killed) return false; vTaskDelay(pdMS_TO_TICKS(50)); }
+  return bleInited;
+}
+#endif
+
+int p_ble(int argc, char** argv) {              // ble on|off | scan [all] | pair <n> | status | forget | boot on|off
+  const char* a = argc > 1 ? argv[1] : "status";
+#ifdef KOA_NO_BLE
+  (void)a; pr("ble: this build has KOA_NO_BLE set\n"); return 1;
+#else
+  Proc* me = procSelf();
+  if (!strcmp(a, "on")) {
+    if (!bleEnsureUp(me)) { pr("ble: could not start\n"); return 1; }
+    pr("ble on. Next: ble scan, then ble pair <n>\n");
+    return 0;
+  }
+  if (!strcmp(a, "off")) {
+    bleEnable(false);
+    for (int t = 0; t < 6000 && bleInited; t += 50) vTaskDelay(pdMS_TO_TICKS(50));
+    pr(bleInited ? "ble: still shutting down\n" : "ble off\n");
+    return 0;
+  }
+  if (!strcmp(a, "scan")) {
+    if (!bleEnsureUp(me)) { pr("ble: could not start\n"); return 1; }
+    pr("scanning for 6 s ...\n");
+    bleScanAll = (argc > 2 && !strcmp(argv[2], "all"));
+    bleReq = 1;
+    bleWaitIdle(me, 15000);
+    return 0;
+  }
+  if (!strcmp(a, "pair")) {
+    if (argc < 3) { pr("usage: ble pair <n>   (n from: ble scan)\n"); return 1; }
+    if (!bleEnsureUp(me)) { pr("ble: could not start\n"); return 1; }
+    blePairIdx = atoi(argv[2]);
+    bleReq = 2;
+    if (!bleWaitIdle(me, 45000)) pr("ble: still pairing in the background (see: ble status)\n");
+    return 0;
+  }
+  if (!strcmp(a, "forget")) {
+    if (!bleEnsureUp(me)) { pr("ble: could not start\n"); return 1; }
+    bleReq = 3;
+    bleWaitIdle(me, 5000);
+    return 0;
+  }
+  if (!strcmp(a, "status")) { bleStatusPrint(); prf("start at boot: %s\n", bleBootFlag() ? "yes" : "no"); return 0; }
+  if (!strcmp(a, "boot") && argc > 2 && (!strcmp(argv[2], "on") || !strcmp(argv[2], "off"))) {
+    bleBootSet(!strcmp(argv[2], "on"));
+    prf("ble will %sstart at boot\n", !strcmp(argv[2], "on") ? "" : "not ");
+    return 0;
+  }
+  pr("usage: ble on|off|scan [all]|pair <n>|status|forget|boot on|off\n");
+  return 1;
+#endif
 }
 
 int p_df(int, char**) {
@@ -1169,6 +1526,7 @@ int p_neofetch(int, char**) {
 }
 
 void drawGpsView(const GpsInfo& g) {
+  OledGfx og; if (!og.ok) return;
   char buf[32];
   display.clearBuffer();
   display.setFont(u8g2_font_logisoso24_tn);
@@ -1185,7 +1543,7 @@ void drawGpsView(const GpsInfo& g) {
     snprintf(buf, sizeof(buf), "Lon: %.6f", g.lng);
     display.drawStr(0, 60, buf);
   } else display.drawStr(0, 46, "No fix yet...");
-  display.sendBuffer();
+  oledFlush();
 }
 
 int p_gps(int argc, char** argv) {
@@ -1406,6 +1764,7 @@ void editKey(char c) {
 }
 
 void drawEdit() {
+  OledGfx og; if (!og.ok) return;
   display.clearBuffer();
   display.setFont(u8g2_font_5x8_tr);
   display.setDrawColor(1);
@@ -1429,7 +1788,7 @@ void drawEdit() {
     display.drawBox((ecx - eleft) * 5, (ecy - etop) * 8, 5, 8);
     display.setDrawColor(1);
   }
-  display.sendBuffer();
+  oledFlush();
 }
 
 void renderEditSerial() {
@@ -2673,6 +3032,34 @@ static m3ApiRawFunction(h_uart_read) {
 
 static bool i2cMine(Proc* wp) { return i2cOpen && i2cOwner == wp->pid; }
 
+// Two buses behind the same four calls. Own bus: Wire1 on the pins the app named. OLED bus: Wire on 17/18, shared with the
+// display. On the shared bus every transfer runs under the OLED lock at the clock the app asked for, and the clock goes back
+// to the display's afterwards. The lock is never held between two calls, so a write with stop=0 is not sent at once: it waits
+// in i2cPend and goes out together with the read that follows (write, repeated start, read).
+static int i2cErr(uint8_t e) { return e == 2 ? KE_NOENT : (e == 5 ? KE_TIMEOUT : (e == 1 ? KE_INVAL : KE_IO)); }   // 2 = no ACK on the address, 5 = bus timeout
+
+static int i2cDoWrite(TwoWire& w, uint8_t addr, const uint8_t* b, int n, bool stop) {
+  w.beginTransmission(addr);
+  if (n && w.write(b, (size_t)n) != (size_t)n) { w.endTransmission(true); return KE_INVAL; }
+  uint8_t e = i2cEnd(w, addr, stop);
+  return e == 0 ? n : i2cErr(e);
+}
+
+static int i2cDoRead(TwoWire& w, uint8_t addr, uint8_t* b, int n) {
+  size_t want = i2cReq(w, addr, (size_t)n);
+  int got = 0;
+  while (got < (int)want && got < n && w.available()) b[got++] = (uint8_t)w.read();
+  return got > 0 ? got : KE_IO;
+}
+
+static bool i2cIsOledChip(int addr) { return addr == 0x3C || addr == 0x3D; }   // the display controller: not for apps to talk to
+
+static void i2cFlushPend() {                     // shared bus only; caller holds the OLED lock and has set the clock
+  if (!i2cPend.valid) return;
+  i2cPend.valid = false;
+  i2cDoWrite(Wire, i2cPend.addr, i2cPend.data, i2cPend.n, true);   // nobody read it: send it with a normal stop
+}
+
 static m3ApiRawFunction(h_i2c_open) {
   m3ApiReturnType(int32_t);
   m3ApiGetArg(int32_t, sda);
@@ -2681,14 +3068,19 @@ static m3ApiRawFunction(h_i2c_open) {
   W_ENTER();
   if (!(wp->held & KC_I2C)) R(KE_PERM);
   if (sda < 0 || scl < 0 || freq < 10000 || freq > 1000000) R(KE_INVAL);
+  bool oledBus = kio_i2c_is_oled_bus(sda, scl);
+  if (oledBus && freq > OLED_BUS_HZ) R(KE_INVAL);                      // the display shares these wires and runs at 400 kHz
   int pins[2] = { sda, scl };
   xSemaphoreTake(resMx, portMAX_DELAY);
   int rc;
   if (i2cOpen) rc = KE_BUSY;                                          // close it first
-  else {
+  else if (oledBus) {                                                 // no pins to claim: the display driver owns them, we only share the bus
+    i2cShared = true; i2cFreq = (uint32_t)freq; i2cPend.valid = false; i2cOpen = true;
+    rc = KE_OK;
+  } else {
     rc = kio_claim_set(&ioPins, pins, 2, wp->pid, KP_I2C);
     if (rc == KE_OK) {
-      if (Wire1.begin(sda, scl, (uint32_t)freq)) i2cOpen = true;
+      if (Wire1.begin(sda, scl, (uint32_t)freq)) { i2cOpen = true; i2cShared = false; }
       else { ioPinsRelease(wp->pid, KP_I2C); rc = KE_IO; }
     }
   }
@@ -2717,11 +3109,16 @@ static m3ApiRawFunction(h_i2c_write) {
   if (!(wp->held & KC_I2C)) R(KE_PERM);
   if (!i2cMine(wp) || addr < 0x08 || addr > 0x77 || n < 0 || n > 128) R(KE_INVAL);
   uint8_t* b = G(bufp, n); NEED(b);
-  Wire1.beginTransmission((uint8_t)addr);
-  if (n && Wire1.write(b, (size_t)n) != (size_t)n) { Wire1.endTransmission(true); R(KE_INVAL); }
-  uint8_t e = Wire1.endTransmission(stop != 0);
-  if (e == 0) R(n);
-  R(e == 2 ? KE_NOENT : (e == 5 ? KE_TIMEOUT : (e == 1 ? KE_INVAL : KE_IO)));   // 2 = no ACK on the address, 5 = bus timeout
+  if (!i2cShared) R(i2cDoWrite(Wire1, (uint8_t)addr, b, n, stop != 0));
+  if (n > 0 && i2cIsOledChip(addr)) R(KE_PERM);                       // probing the display is fine, talking to it is not
+  OledLock lk;
+  Wire.setClock(i2cFreq);
+  i2cFlushPend();
+  int rc;
+  if (n > 0 && !stop) { memcpy(i2cPend.data, b, (size_t)n); i2cPend.addr = (uint8_t)addr; i2cPend.n = (uint8_t)n; i2cPend.valid = true; rc = n; }
+  else rc = i2cDoWrite(Wire, (uint8_t)addr, b, n, true);
+  Wire.setClock(OLED_BUS_HZ);
+  R(rc);
 }
 
 static m3ApiRawFunction(h_i2c_read) {
@@ -2733,10 +3130,25 @@ static m3ApiRawFunction(h_i2c_read) {
   if (!(wp->held & KC_I2C)) R(KE_PERM);
   if (!i2cMine(wp) || addr < 0x08 || addr > 0x77 || n <= 0 || n > 128) R(KE_INVAL);
   uint8_t* b = G(bufp, n); NEED(b);
-  size_t want = Wire1.requestFrom((uint16_t)addr, (size_t)n, true);
-  int got = 0;
-  while (got < (int)want && got < n && Wire1.available()) b[got++] = (uint8_t)Wire1.read();
-  R(got > 0 ? got : KE_IO);
+  if (!i2cShared) R(i2cDoRead(Wire1, (uint8_t)addr, b, n));
+  if (i2cIsOledChip(addr)) R(KE_PERM);
+  OledLock lk;
+  Wire.setClock(i2cFreq);
+  int rc;
+  if (i2cPend.valid && i2cPend.addr == addr) {                        // register read: pointer write, repeated start, read
+    i2cPend.valid = false;
+    Wire.beginTransmission((uint8_t)addr);
+    if (Wire.write(i2cPend.data, (size_t)i2cPend.n) != (size_t)i2cPend.n) { Wire.endTransmission(true); rc = KE_INVAL; }
+    else {
+      uint8_t e = i2cEnd(Wire, (uint8_t)addr, false);
+      rc = e ? i2cErr(e) : i2cDoRead(Wire, (uint8_t)addr, b, n);
+    }
+  } else {
+    i2cFlushPend();
+    rc = i2cDoRead(Wire, (uint8_t)addr, b, n);
+  }
+  Wire.setClock(OLED_BUS_HZ);
+  R(rc);
 }
 
 static bool spiMine(Proc* wp) { return spiOpen && spiOwner == wp->pid; }
@@ -2805,6 +3217,162 @@ static m3ApiRawFunction(h_spi_transfer) {
 
 // ---------------- the import table: module "koa", names/signatures from koaos_abi.h ----------------
 struct HostFn { const char* name; const char* sig; M3RawCall fn; };
+// ---------------- OLED (ABI 3) ----------------
+// Apps draw into the same U8g2 buffer the console uses. That is safe because while an app holds KC_DISPLAY every kernel
+// drawing function steps aside (OledGfx.ok is false), and each call below holds the OLED lock. Draw color and font mode are
+// put back to the kernel's defaults at the end of each call, so nothing leaks into the console's drawing afterwards.
+#define OLED_APP_ENTER() \
+  W_ENTER(); \
+  if (!(wp->held & KC_DISPLAY)) R(KE_PERM); \
+  OledLock oled_lk; \
+  if (oledAppFresh) { oledAppFresh = false; display.clearBuffer(); display.setDrawColor(1); }
+
+static inline bool oledColorOk(int c) { return c >= KOLED_BLACK && c <= KOLED_XOR; }
+static inline bool oledCoordOk(int v) { return v >= -1024 && v <= 1024; }
+static inline int  oledMin(int a, int b) { return a < b ? a : b; }
+static inline int  oledMax(int a, int b) { return a > b ? a : b; }
+
+static void oledPix(int x, int y) { if (x >= 0 && x < KOLED_W && y >= 0 && y < KOLED_H) display.drawPixel((u8g2_uint_t)x, (u8g2_uint_t)y); }
+
+static void oledLineC(int x0, int y0, int x1, int y1) {          // Bresenham; endpoints may be off screen, every pixel is clipped
+  int dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
+  int dy = -(y1 > y0 ? y1 - y0 : y0 - y1), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  for (;;) {
+    oledPix(x0, y0);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+static void oledRectC(int x, int y, int w, int h, bool fill) {
+  if (w <= 0 || h <= 0) return;
+  if (fill) {
+    int x0 = oledMax(x, 0), y0 = oledMax(y, 0), x1 = oledMin(x + w, KOLED_W), y1 = oledMin(y + h, KOLED_H);
+    if (x0 < x1 && y0 < y1) display.drawBox((u8g2_uint_t)x0, (u8g2_uint_t)y0, (u8g2_uint_t)(x1 - x0), (u8g2_uint_t)(y1 - y0));
+    return;
+  }
+  oledLineC(x, y, x + w - 1, y);                                    // outline: no corner is drawn twice, so XOR stays correct
+  if (h > 1) oledLineC(x, y + h - 1, x + w - 1, y + h - 1);
+  if (h > 2) { oledLineC(x, y + 1, x, y + h - 2); if (w > 1) oledLineC(x + w - 1, y + 1, x + w - 1, y + h - 2); }
+}
+
+static const uint8_t* oledFont(int f) {
+  switch (f) {
+    case KOLED_FONT_MEDIUM: return u8g2_font_6x12_tr;
+    case KOLED_FONT_LARGE:  return u8g2_font_helvB14_tr;
+    default:                return u8g2_font_5x8_tr;
+  }
+}
+
+static m3ApiRawFunction(h_oled_clear) {
+  m3ApiReturnType(int32_t);
+  OLED_APP_ENTER();
+  display.clearBuffer();
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_flush) {
+  m3ApiReturnType(int32_t);
+  OLED_APP_ENTER();
+  display.sendBuffer();
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_pixel) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, x);
+  m3ApiGetArg(int32_t, y);
+  m3ApiGetArg(int32_t, color);
+  OLED_APP_ENTER();
+  if (!oledCoordOk(x) || !oledCoordOk(y) || !oledColorOk(color)) R(KE_INVAL);
+  display.setDrawColor((uint8_t)color);
+  oledPix(x, y);
+  display.setDrawColor(1);
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_line) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, x0);
+  m3ApiGetArg(int32_t, y0);
+  m3ApiGetArg(int32_t, x1);
+  m3ApiGetArg(int32_t, y1);
+  m3ApiGetArg(int32_t, color);
+  OLED_APP_ENTER();
+  if (!oledCoordOk(x0) || !oledCoordOk(y0) || !oledCoordOk(x1) || !oledCoordOk(y1) || !oledColorOk(color)) R(KE_INVAL);
+  display.setDrawColor((uint8_t)color);
+  oledLineC(x0, y0, x1, y1);
+  display.setDrawColor(1);
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_rect) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, x);
+  m3ApiGetArg(int32_t, y);
+  m3ApiGetArg(int32_t, w);
+  m3ApiGetArg(int32_t, h);
+  m3ApiGetArg(int32_t, fill);
+  m3ApiGetArg(int32_t, color);
+  OLED_APP_ENTER();
+  if (!oledCoordOk(x) || !oledCoordOk(y) || w < 0 || h < 0 || w > 2048 || h > 2048 || !oledColorOk(color)) R(KE_INVAL);
+  display.setDrawColor((uint8_t)color);
+  oledRectC(x, y, w, h, fill != 0);
+  display.setDrawColor(1);
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_text) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, x);
+  m3ApiGetArg(int32_t, y);
+  m3ApiGetArg(int32_t, font);
+  m3ApiGetArg(uint32_t, sp);
+  m3ApiGetArg(int32_t, color);
+  OLED_APP_ENTER();
+  char str[64];
+  if (gstr(runtime, _mem, sp, str, sizeof(str)) < 0) R(KE_INVAL);
+  if (x < 0 || x >= KOLED_W || y < 0 || y > 127 || font < KOLED_FONT_SMALL || font > KOLED_FONT_LARGE || !oledColorOk(color)) R(KE_INVAL);
+  display.setFont(oledFont(font));
+  display.setFontMode(1);                                           // no background box behind the glyphs
+  display.setDrawColor((uint8_t)color);
+  int wpx = (int)display.drawStr((u8g2_uint_t)x, (u8g2_uint_t)y, str);
+  display.setFontMode(0);
+  display.setDrawColor(1);
+  R(wpx);
+}
+
+static m3ApiRawFunction(h_oled_bitmap) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, x);
+  m3ApiGetArg(int32_t, y);
+  m3ApiGetArg(int32_t, w);
+  m3ApiGetArg(int32_t, h);
+  m3ApiGetArg(uint32_t, bitsp);
+  OLED_APP_ENTER();
+  if (!oledCoordOk(x) || !oledCoordOk(y) || w < 1 || w > KOLED_W || h < 1 || h > KOLED_H) R(KE_INVAL);
+  int rb = (w + 7) / 8;
+  const uint8_t* bits = G(bitsp, rb * h); NEED(bits);
+  display.setDrawColor(1);
+  for (int j = 0; j < h; j++)
+    for (int i = 0; i < w; i++)
+      if (bits[j * rb + i / 8] & (0x80 >> (i & 7))) oledPix(x + i, y + j);
+  R(KE_OK);
+}
+
+static m3ApiRawFunction(h_oled_contrast) {
+  m3ApiReturnType(int32_t);
+  m3ApiGetArg(int32_t, level);
+  OLED_APP_ENTER();
+  if (level < 0 || level > 255) R(KE_INVAL);
+  display.setContrast((uint8_t)level);
+  oledContrastDirty = true;                                         // the main loop restores the default once the app lets go
+  R(KE_OK);
+}
+
 static const HostFn kHostFns[] = {
   {"koa_abi_version", "i()",      h_abi_version},
   {"koa_exit",        "v(i)",     h_exit},
@@ -2855,6 +3423,15 @@ static const HostFn kHostFns[] = {
   {"koa_spi_open",     "i(iiiiii)", h_spi_open},
   {"koa_spi_close",    "i()",       h_spi_close},
   {"koa_spi_transfer", "i(iiii)",   h_spi_transfer},
+  // ABI 3: the OLED (I2C on the OLED bus needs no new calls: koa_i2c_open(17, 18, hz))
+  {"koa_oled_clear",    "i()",         h_oled_clear},
+  {"koa_oled_flush",    "i()",         h_oled_flush},
+  {"koa_oled_pixel",    "i(iii)",      h_oled_pixel},
+  {"koa_oled_line",     "i(iiiii)",    h_oled_line},
+  {"koa_oled_rect",     "i(iiiiii)",   h_oled_rect},
+  {"koa_oled_text",     "i(iiiii)",    h_oled_text},
+  {"koa_oled_bitmap",   "i(iiiii)",    h_oled_bitmap},
+  {"koa_oled_contrast", "i(i)",        h_oled_contrast},
 };
 
 // ---------------- the process entry point for type=wasm packages ----------------
@@ -3050,20 +3627,22 @@ int p_aprsd(int argc, char** argv) {
 void aprsDraw() {
   char l[40];
   String ser = "\x1b[H\x1b[2J";
-  display.clearBuffer();
-  display.setFont(u8g2_font_5x8_tr);
-  snprintf(l, sizeof(l), "%.8s rx%d tx%d", aprsId, aprsRx, aprsTx);
-  display.drawStr(0, 7, l);
-  ser += l; ser += "\r\n";
-  xSemaphoreTake(aprsMx, portMAX_DELAY);
-  for (int i = 0; i < heardN; i++) {
-    Heard& h = heard[i];
-    snprintf(l, sizeof(l), "%-9.9s %4d %+3d %4lus", h.call, (int)h.rssi, (int)h.snr, (millis() - h.ms) / 1000);
-    display.drawStr(0, (i + 1) * 8 + 7, l);
-    ser += l; ser += "  "; ser += h.text; ser += "\r\n";
+  {
+    OledGfx og;                                  // its own block: the OLED lock must be let go before we write to the terminal
+    if (og.ok) { display.clearBuffer(); display.setFont(u8g2_font_5x8_tr); }
+    snprintf(l, sizeof(l), "%.8s rx%d tx%d", aprsId, aprsRx, aprsTx);
+    if (og.ok) display.drawStr(0, 7, l);
+    ser += l; ser += "\r\n";
+    xSemaphoreTake(aprsMx, portMAX_DELAY);
+    for (int i = 0; i < heardN; i++) {
+      Heard& h = heard[i];
+      snprintf(l, sizeof(l), "%-9.9s %4d %+3d %4lus", h.call, (int)h.rssi, (int)h.snr, (millis() - h.ms) / 1000);
+      if (og.ok) display.drawStr(0, (i + 1) * 8 + 7, l);
+      ser += l; ser += "  "; ser += h.text; ser += "\r\n";
+    }
+    xSemaphoreGive(aprsMx);
+    if (og.ok) oledFlush();
   }
-  xSemaphoreGive(aprsMx);
-  display.sendBuffer();
   ser += "q = back";
   sys_write(1, ser.c_str(), ser.length());
 }
@@ -3125,12 +3704,13 @@ static void* guiAlloc(size_t n) { void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRA
 static void guiFree(void* p) { free(p); }
 static void guiPsram(unsigned long* fr, unsigned long* tot) { *fr = heap_caps_get_free_size(MALLOC_CAP_SPIRAM); *tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM); }
 static void guiOled() {                           // the OLED is ours while the desktop runs (TTY_GFX stops the console drawing it)
+  OledGfx og; if (!og.ok) return;
   display.clearBuffer();
   display.setFont(u8g2_font_6x12_tr);
   display.drawStr(0, 14, "KoaOS desktop");
-  display.drawStr(0, 30, "on the VGA output");
+  display.drawStr(0, 30, rcaActive() ? "on the RCA output" : "on the VGA output");
   display.drawStr(0, 54, "Esc = power menu");
-  display.sendBuffer();
+  oledFlush();
 }
 #include "koa_gui.h"
 #else
@@ -3607,7 +4187,7 @@ const Prog progs[] = {
   {"gps", p_gps, 0}, {"edit", p_edit, 0}, {"nano", p_edit, 0}, {"vi", p_edit, 0},
   {"neofetch", p_neofetch, 0}, {"fetch", p_neofetch, 0},
   {"wifi", p_wifi, 0}, {"aprs", p_aprs, 0}, {"aprsd", p_aprsd, 0},
-  {"ps", p_ps, 0}, {"pins", p_pins, 0}, {"vga", p_vga, 0}, {"gui", p_gui, PF_BIGSTACK}, {"kill", p_kill, 0}, {"sleep", p_sleep, 0},
+  {"ps", p_ps, 0}, {"pins", p_pins, 0}, {"i2c", p_i2c, 0}, {"vga", p_vga, 0}, {"rca", p_rca, 0}, {"ble", p_ble, 0}, {"gui", p_gui, PF_BIGSTACK}, {"kill", p_kill, 0}, {"sleep", p_sleep, 0},
   {"run", p_run, 0}, {"install", p_install, PF_BIGSTACK}, {"uninstall", p_uninstall, 0}, {"apps", p_apps, 0},
   {"weather", p_weather, PF_BIGSTACK},
   {"login", p_login, PF_NOKILL}, {"sh", p_sh, PF_NOKILL},
@@ -3654,6 +4234,7 @@ void setup() {
   digitalWrite(GNSS_PWR, HIGH);  // GPS off until "gps start"
   delay(100);
 
+  oledMx = xSemaphoreCreateRecursiveMutex();
   display.begin();
   memset(scr, 0, sizeof(scr));
   ttyMx = xSemaphoreCreateMutex();
@@ -3676,6 +4257,12 @@ void setup() {
     int r = vgaEnable(&who);
     bootMsg(r == KE_OK ? "tty1: vga 640x480 ready" : "tty1: vga FAILED", 200);
   }
+  if (ok && rcaBootFlag()) {                     // if VGA already holds GPIO6/3 this says FAILED: switch only one of the two on at boot
+    const char* who = "?";
+    int r = rcaEnable(&who);
+    bootMsg(r == KE_OK ? "tty2: rca composite ready" : "tty2: rca FAILED", 200);
+  }
+  if (ok && bleBootFlag()) { bleEnable(true); bootMsg("ble: keyboard on", 200); }
   bootMsg("gps: standby", 200);
   bootMsg("proc: starting init", 300);
   kprintf("\n%s %s tty1\n\n", OSNAME, OSVER);
@@ -3693,15 +4280,21 @@ void loop() {
   }
 
   while (Serial.available()) ttyInputChar((char)Serial.read());
+  bleKeyPump();                                // keys from a Bluetooth keyboard enter the console here, same as USB
 
   unsigned long now = millis();
   static unsigned long lastReap = 0;
   if (now - lastReap > 250) { lastReap = now; wasmReaper(); }   // enforces kill on wasm apps stuck in pure computation
   if (now - lastBlink > 500) { lastBlink = now; blinkOn = !blinkOn; dirty = true; }
 
-  if (dirty && !(ttyFlags & TTY_GFX) && now - lastDraw > 40) {
+  if (oledContrastDirty && !dispApp) {          // an app changed the contrast and let go of the screen: default back
+    oledContrastDirty = false;
+    OledLock l;
+    display.setContrast(OLED_CONTRAST);
+  }
+  if (dirty && !(ttyFlags & TTY_GFX) && !dispApp && now - lastDraw > 40) {   // an app that owns the screen draws it itself
     xSemaphoreTake(ttyMx, portMAX_DELAY);
-    if (!(ttyFlags & TTY_GFX)) {
+    if (!(ttyFlags & TTY_GFX) && !dispApp) {
       dirty = false;
       lastDraw = now;
       drawTerm();
@@ -3709,7 +4302,7 @@ void loop() {
     xSemaphoreGive(ttyMx);
   }
   static unsigned long lastVga = 0;
-  if (vgaActive() && now - lastVga > 33) {   // the picture is generated continuously; this only drives the cursor blink
+  if ((vgaActive() || rcaActive()) && now - lastVga > 33) {   // the picture is generated continuously; this only drives the cursor blink
     lastVga = now;
     xSemaphoreTake(ttyMx, portMAX_DELAY);
     vgaFlush(blinkOn);

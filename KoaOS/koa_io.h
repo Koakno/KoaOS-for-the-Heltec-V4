@@ -28,7 +28,7 @@
  * Deliberately NOT allowed (taken by the OS or risky on the Heltec V4):
  *   0            boot button / strapping            1        battery sense
  *   2 7 46       LoRa front-end enable/power/PA     8-14     LoRa radio (SPI, reset, busy, DIO1)
- *   17 18 21     OLED (I2C + reset)                 19 20    native USB
+ *   17 18 21     OLED (I2C + reset; 17/18 only as the shared I2C pair, see below)   19 20    native USB
  *   34 38 39     GNSS power / UART                  36       Vext power switch
  *   35 37        LED / battery-sense control        43 44    UART0 (USB serial monitor)
  *   45           strapping (flash voltage)          26,33 and the 27-32 block:
@@ -54,6 +54,13 @@
                               (1ULL << 17) | (1ULL << 18) | (1ULL << 21) | (1ULL << 36) | \
                               (1ULL << 34) | (1ULL << 38) | (1ULL << 39) | \
                               (1ULL << 19) | (1ULL << 20) | (1ULL << 43) | (1ULL << 44))
+
+/* GPIO17 / GPIO18 are the OLED's I2C bus. They can never be GPIO, UART or SPI pins, and kio_claim never hands them out.
+ * An app may open I2C on exactly this pair (SDA = 17, SCL = 18); the OS then shares the bus with the display instead of
+ * claiming the pins (see koaos_abi.h). Nothing else about these pins changes. */
+#define KIO_OLED_SDA 17
+#define KIO_OLED_SCL 18
+static inline int kio_i2c_is_oled_bus(int sda, int scl) { return sda == KIO_OLED_SDA && scl == KIO_OLED_SCL; }
 
 enum { KP_NONE = 0, KP_GPIO, KP_UART, KP_I2C, KP_SPI };   /* what an owned pin is being used for */
 

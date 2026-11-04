@@ -8,6 +8,8 @@
  * the GUI runs. Never put video memory in PSRAM: it is too slow for this (it caused stray-line glitches).
  * Shell:  vga on | vga off   (see p_vga in KoaOS.ino).  vgaBegin() claims the LCD peripheral and the six pins,
  * vgaEnd() gives both back, so the pins are plain GPIO again while VGA is off.
+ * Composite video on GPIO6 is a second output for the same text buffer and framebuffer: koa_rca.h (shell: rca on|off). GPIO6 is VGA's
+ * blue pin, so only one of the two runs at a time.
  * Define KOA_NO_VGA (or -DKOA_NO_VGA) to compile it out entirely (needed on arduino-esp32 2.x, which has no esp_lcd RGB driver).
  *
  * Wiring (R/G/B each through ~220-330 ohm if you have them; weakest drive strength is set in software):
@@ -64,6 +66,8 @@ static volatile bool vgaCurOn = true;
 static uint8_t vgaCurColor = 7;
 static int vgaEsc = 0, vgaNum = 0;
 static volatile bool vgaReady = false;
+static volatile bool rcaReady = false;        // composite video (koa_rca.h) is running; it shows this same text buffer and framebuffer
+static int vgaCols = VGA_COLS, vgaRows = VGA_ROWS;   // console size right now: 80x30 on VGA, 40x24 on RCA (the arrays stay 80x30)
 static uint8_t  vgaFontRam[95][8];
 static uint32_t vgaExpLo[256], vgaExpHi[256];
 static esp_lcd_panel_handle_t vgaPanel = nullptr;
@@ -122,16 +126,16 @@ static void vgaClear() {
 
 static void vgaNewLine() {
   vgaCx = 0;
-  if (vgaCy < VGA_ROWS - 1) { vgaCy = vgaCy + 1; return; }
-  memmove(vgaText[0], vgaText[1], (VGA_ROWS - 1) * VGA_COLS);
-  memmove(vgaCol[0], vgaCol[1], (VGA_ROWS - 1) * VGA_COLS);
-  memset(vgaText[VGA_ROWS - 1], ' ', VGA_COLS);
-  memset(vgaCol[VGA_ROWS - 1], 7, VGA_COLS);
+  if (vgaCy < vgaRows - 1) { vgaCy = vgaCy + 1; return; }
+  memmove(vgaText[0], vgaText[1], (vgaRows - 1) * VGA_COLS);       // rows keep their 80 byte stride in both modes
+  memmove(vgaCol[0], vgaCol[1], (vgaRows - 1) * VGA_COLS);
+  memset(vgaText[vgaRows - 1], ' ', VGA_COLS);
+  memset(vgaCol[vgaRows - 1], 7, VGA_COLS);
 }
 
 // same input rules as scrPut(): \n, \r, printable ASCII, ESC[J (clear) and ESC[H (home)
 static void vgaPut(char c) {
-  if (!vgaReady) return;
+  if (!vgaReady && !rcaReady) return;
   if (vgaEsc == 1) { if (c == '[') { vgaEsc = 2; vgaNum = 0; } else vgaEsc = 0; return; }
   if (vgaEsc == 2) {
     if (c >= '0' && c <= '9') { vgaNum = vgaNum * 10 + (c - '0'); return; }
@@ -144,14 +148,14 @@ static void vgaPut(char c) {
   if (c == '\r') return;
   if (c == '\n') { vgaNewLine(); return; }
   if (c < 32 || c > 126) return;
-  if (vgaCx >= VGA_COLS) vgaNewLine();
+  if (vgaCx >= vgaCols) vgaNewLine();
   vgaText[vgaCy][vgaCx] = c;
   vgaCol[vgaCy][vgaCx] = vgaCurColor;
   vgaCx = vgaCx + 1;
 }
 
 static void vgaBackspace() {
-  if (!vgaReady || vgaCx <= 0) return;
+  if ((!vgaReady && !rcaReady) || vgaCx <= 0) return;
   vgaCx = vgaCx - 1;
   vgaText[vgaCy][vgaCx] = ' ';
 }
@@ -164,7 +168,7 @@ static inline bool vgaActive() { return vgaReady; }
 // Switch the picture to graphics mode: allocates the 38 KB framebuffer in internal RAM (never PSRAM: too slow for video).
 // Returns false if there is no contiguous internal RAM left. Text mode comes back, untouched, after vgaGfxEnd().
 static bool vgaGfxBegin() {
-  if (!vgaReady) return false;
+  if (!vgaReady && !rcaReady) return false;                  // the same framebuffer feeds VGA or, when RCA is on, the composite output
   if (gfxFb) return true;
   for (int b = 0; b < 256; b++) {
     uint32_t lo = b & 7, hi = (b >> 4) & 7;                   // left pixel = low nibble, right pixel = high nibble
@@ -203,6 +207,7 @@ static void vgaEnd() {
 // returns true on success (also if it is already running). On failure everything is undone.
 static bool vgaBegin() {
   if (vgaReady) return true;
+  if (rcaReady) return false;                    // GPIO6 is composite video's pin while RCA runs
   memcpy(vgaFontRam, vgaFont, sizeof(vgaFontRam));
   for (int b = 0; b < 256; b++) {
     uint32_t lo = 0, hi = 0;
@@ -213,6 +218,7 @@ static bool vgaBegin() {
     vgaExpLo[b] = lo; vgaExpHi[b] = hi;
   }
   vgaEsc = 0; vgaNum = 0;
+  vgaCols = VGA_COLS; vgaRows = VGA_ROWS;
   vgaClear();
 
   esp_lcd_rgb_panel_config_t cfg = {};

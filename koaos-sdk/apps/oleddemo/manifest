@@ -1,0 +1,6 @@
+name=oleddemo
+version=1.0
+abi=3
+type=wasm
+entry=oleddemo.wasm
+requires=display
