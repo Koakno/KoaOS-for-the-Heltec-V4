@@ -52,7 +52,7 @@ HWCDC USBSerial;
 #define WASM_PSRAM_RESERVE  (128u * 1024u)    // PSRAM that is never handed to apps
 #define WASM_RT_STACK       (12 * 1024)       // wasm3 value stack, allocated in PSRAM
 #define WASM_MAX_BIN        (256u * 1024u)    // biggest .wasm accepted
-#define WASM_TASK_STACK     49152             // native stack of the interpreter task (internal RAM). wasm3 has no tail calls on Xtensa, so stack use grows with the longest straight-line run of wasm ops (meshcore: ~520)
+#define WASM_TASK_STACK     98304             // native stack of the interpreter task (internal RAM). wasm3 has no tail calls on Xtensa, so stack use grows with the longest straight-line run of wasm ops (meshcore: ~520)
 
 #define TTY_RAW      1   // no line discipline
 #define TTY_NOECHO   2
