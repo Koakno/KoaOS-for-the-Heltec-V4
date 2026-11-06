@@ -12,6 +12,56 @@ Then **install apps over Wi-Fi without ever reflashing**, or write your own with
 
 ---
 
+## Security and threat model
+
+KoaOS is a hobby OS for the Heltec WiFi LoRa 32 V4. It is meant for networks
+you control, not hostile environments. Here is what it does and doesn't
+protect against.
+
+### What it protects against
+- **Apps are sandboxed.** Installed apps run as WebAssembly in an interpreter
+  and can't touch kernel memory.
+- **Apps declare what they use.** Each app's manifest lists the hardware it
+  needs (Wi-Fi, LoRa, GPS, GPIO, and so on). The installer prints this as
+  `it uses: ...`, and the kernel enforces it: a capability that isn't declared
+  returns a permission error.
+- **Apps can only reach their own files.** An app's file access is limited to
+  its own folder (`/data/<app>/`): no subdirectories, no dot-files, no
+  escaping the folder.
+- **Pins are claimed one at a time.** The display bus pins can never be given
+  to an app.
+- **No listening services.** The OS doesn't run a server. Anything that
+  accepts incoming connections is an app you chose to install.
+- **Nothing starts on its own** except the login prompt and, if you turn them
+  on, the VGA, RCA and GUI outputs.
+
+**Read the `uses:` line before you keep an app.** A calculator that wants LoRa
+and GPS is not a calculator.
+
+### What it does NOT protect against
+- **Physical access.** Secure boot and flash encryption are not enabled. Anyone
+  holding the device can dump and read the flash. The login prompt is a
+  convenience, not a lock.
+- **Untrusted networks.** HTTPS connections don't validate certificates. The
+  hash inside an `.esp` package catches corrupted downloads, but it travels
+  with the file, so it can't detect a deliberately swapped one. Install apps
+  only over a network you trust, and run the app server from a computer you
+  trust.
+- **Shell-script apps.** A script app runs shell commands with the shell's own
+  authority and isn't sandboxed like a wasm app. The installer tells you when
+  something is a script. Only install scripts you've read or trust.
+- **An app misusing what it declared.** An app that declares Wi-Fi can still
+  send out any data it can reach.
+- **Radio and GPS input.** Treat anything received over LoRa or from the GNSS
+  module as untrusted. The built-in GPS and APRS demo run as part of the OS,
+  not in the sandbox, and haven't been audited against malformed input.
+
+### Reporting problems
+Open an issue on GitHub.
+
+
+---
+
 ## Getting started
 
 You need a Heltec WiFi LoRa 32 **V4** (not V3: KoaOS needs the V4's PSRAM), a USB cable, and the Arduino IDE
